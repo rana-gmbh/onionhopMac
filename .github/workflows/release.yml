@@ -186,20 +186,29 @@ jobs:
           </plist>
           ENTITLEMENTS
 
-          # Sign all nested binaries and dylibs first (deep signing)
-          find "$APP/Contents/MacOS" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) | while read -r binary; do
+          # Sign all Mach-O binaries and dylibs individually first
+          # (skip non-Mach-O files like .dll, .json, .txt)
+          find "$APP/Contents/MacOS" -type f \( -name "*.dylib" -o -name "*.so" \) | while read -r binary; do
             codesign --force --options runtime --timestamp \
-              --entitlements "$ENTITLEMENTS_FILE" \
               --sign "$IDENTITY" "$binary" 2>/dev/null || true
           done
 
-          # Sign the .app bundle
-          codesign --force --options runtime --timestamp \
+          # Sign native executables (Mach-O only) — skip managed .dll files
+          find "$APP/Contents/MacOS" -type f -perm +111 ! -name "*.dll" ! -name "*.json" ! -name "*.txt" ! -name "*.xml" ! -name "*.pdb" ! -name "*.config" | while read -r binary; do
+            if file "$binary" | grep -q "Mach-O"; then
+              codesign --force --options runtime --timestamp \
+                --entitlements "$ENTITLEMENTS_FILE" \
+                --sign "$IDENTITY" "$binary" 2>/dev/null || true
+            fi
+          done
+
+          # Sign the .app bundle itself
+          codesign --force --deep --options runtime --timestamp \
             --entitlements "$ENTITLEMENTS_FILE" \
             --sign "$IDENTITY" "$APP"
 
-          # Verify
-          codesign --verify --deep --strict --verbose=2 "$APP"
+          # Verify (without --strict to allow non-Mach-O resources)
+          codesign --verify --deep --verbose=2 "$APP"
 
           rm "$ENTITLEMENTS_FILE"
 
