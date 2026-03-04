@@ -1,0 +1,276 @@
+name: Build, Sign & Release macOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 2.4.3)'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_VERSION: '9.0.x'
+  APP_NAME: OnionHop
+  BUNDLE_ID: com.onionhop.v2
+  PUBLISH_DIR: publish/OnionHop.app
+
+jobs:
+  build-sign-release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(date +%Y.%m.%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish for macOS (arm64)
+        run: |
+          dotnet publish src/OnionHopV2.App \
+            -c Release \
+            -r osx-arm64 \
+            --self-contained true \
+            -p:PublishSingleFile=false \
+            -p:Version=${{ steps.version.outputs.version }} \
+            -o build/arm64
+
+      - name: Publish for macOS (x64)
+        run: |
+          dotnet publish src/OnionHopV2.App \
+            -c Release \
+            -r osx-x64 \
+            --self-contained true \
+            -p:PublishSingleFile=false \
+            -p:Version=${{ steps.version.outputs.version }} \
+            -o build/x64
+
+      - name: Create universal binaries
+        run: |
+          mkdir -p build/universal
+          # Create universal binary for the main executable
+          lipo -create build/arm64/OnionHopV2 build/x64/OnionHopV2 \
+            -output build/universal/OnionHopV2 || cp build/arm64/OnionHopV2 build/universal/OnionHopV2
+
+          # Use arm64 build as base, replace main binary with universal
+          cp -R build/arm64/ build/universal-full/
+          cp build/universal/OnionHopV2 build/universal-full/OnionHopV2
+
+      - name: Create .app bundle
+        run: |
+          APP="publish/${{ env.APP_NAME }}.app"
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          # Copy all published files into MacOS
+          cp -R build/universal-full/* "$APP/Contents/MacOS/"
+
+          # Ensure tor binaries are executable
+          chmod +x "$APP/Contents/MacOS/tor/tor" 2>/dev/null || true
+          chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/lyrebird" 2>/dev/null || true
+          chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/conjure-client" 2>/dev/null || true
+
+          # Copy icon if available
+          if [ -f src/OnionHopV2.App/Assets/logo.png ]; then
+            cp src/OnionHopV2.App/Assets/logo.png "$APP/Contents/Resources/AppIcon.png"
+          fi
+
+          # Create Info.plist
+          VERSION="${{ steps.version.outputs.version }}"
+          cat > "$APP/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>${{ env.APP_NAME }}</string>
+            <key>CFBundleDisplayName</key>
+            <string>${{ env.APP_NAME }}</string>
+            <key>CFBundleIdentifier</key>
+            <string>${{ env.BUNDLE_ID }}</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>OnionHopV2</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>12.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>LSApplicationCategoryType</key>
+            <string>public.app-category.utilities</string>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          # Decode certificate
+          echo "$CERTIFICATE_BASE64" | base64 --decode > /tmp/certificate.p12
+
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import certificate
+          security import /tmp/certificate.p12 \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Add keychain to search list
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          # Allow codesign to access the key without prompting
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Clean up
+          rm /tmp/certificate.p12
+
+      - name: Sign application
+        run: |
+          APP="publish/${{ env.APP_NAME }}.app"
+          IDENTITY="Developer ID Application: Rana GmbH (${{ secrets.APPLE_TEAM_ID }})"
+          ENTITLEMENTS_FILE=$(mktemp)
+
+          # Create entitlements
+          cat > "$ENTITLEMENTS_FILE" << 'ENTITLEMENTS'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+            <true/>
+            <key>com.apple.security.network.client</key>
+            <true/>
+            <key>com.apple.security.network.server</key>
+            <true/>
+          </dict>
+          </plist>
+          ENTITLEMENTS
+
+          # Sign all nested binaries and dylibs first (deep signing)
+          find "$APP/Contents/MacOS" -type f \( -perm +111 -o -name "*.dylib" -o -name "*.so" \) | while read -r binary; do
+            codesign --force --options runtime --timestamp \
+              --entitlements "$ENTITLEMENTS_FILE" \
+              --sign "$IDENTITY" "$binary" 2>/dev/null || true
+          done
+
+          # Sign the .app bundle
+          codesign --force --options runtime --timestamp \
+            --entitlements "$ENTITLEMENTS_FILE" \
+            --sign "$IDENTITY" "$APP"
+
+          # Verify
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          rm "$ENTITLEMENTS_FILE"
+
+      - name: Create DMG
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DMG_NAME="${{ env.APP_NAME }}-${VERSION}-macOS.dmg"
+
+          # Create DMG
+          hdiutil create -volname "${{ env.APP_NAME }}" \
+            -srcfolder publish \
+            -ov -format UDZO \
+            "dist/${DMG_NAME}" || {
+              mkdir -p dist
+              hdiutil create -volname "${{ env.APP_NAME }}" \
+                -srcfolder publish \
+                -ov -format UDZO \
+                "dist/${DMG_NAME}"
+            }
+
+          # Sign DMG
+          IDENTITY="Developer ID Application: Rana GmbH (${{ secrets.APPLE_TEAM_ID }})"
+          codesign --force --timestamp --sign "$IDENTITY" "dist/${DMG_NAME}"
+
+          echo "DMG_PATH=dist/${DMG_NAME}" >> "$GITHUB_ENV"
+          echo "DMG_NAME=${DMG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Submit for notarization
+          xcrun notarytool submit "${{ env.DMG_PATH }}" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait \
+            --timeout 30m
+
+          # Staple the notarization ticket to the DMG
+          xcrun stapler staple "${{ env.DMG_PATH }}"
+
+          # Verify stapling
+          xcrun stapler validate "${{ env.DMG_PATH }}"
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          name: OnionHop ${{ steps.version.outputs.version }}
+          body: |
+            ## OnionHop ${{ steps.version.outputs.version }} for macOS
+
+            ### Installation
+            1. Download the `.dmg` file below
+            2. Open the DMG and drag OnionHop to Applications
+            3. Launch OnionHop from Applications
+
+            ### What's included
+            - Tor with pluggable transports (obfs4, snowflake, conjure, webtunnel)
+            - Proxy mode and TUN/VPN mode support
+            - GeoIP database for country-specific exit nodes
+          files: ${{ env.DMG_PATH }}
+          draft: false
+          prerelease: false
+          make_latest: true
