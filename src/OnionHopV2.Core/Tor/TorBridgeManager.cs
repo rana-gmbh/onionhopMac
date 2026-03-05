@@ -1211,13 +1211,16 @@ internal sealed class TorBridgeManager
 
     private static string EnsureSnowflakeClientPlugin(string pluginLine, string ptRelativePath)
     {
-        if (pluginLine.Contains(SnowflakeClientFileName, StringComparison.OrdinalIgnoreCase))
+        // Lyrebird 0.8+ natively supports the snowflake transport — no separate
+        // snowflake-client binary is needed.  Accept either lyrebird or snowflake-client.
+        if (pluginLine.Contains(LyrebirdFileName, StringComparison.OrdinalIgnoreCase) ||
+            pluginLine.Contains(SnowflakeClientFileName, StringComparison.OrdinalIgnoreCase))
         {
             return pluginLine;
         }
 
-        // Some bundled pt_config.json files incorrectly map snowflake to lyrebird.exe. Override safely.
-        return $"ClientTransportPlugin snowflake exec {Path.Combine(ptRelativePath, SnowflakeClientFileName)}";
+        // Fallback: use lyrebird for the snowflake transport.
+        return $"ClientTransportPlugin snowflake exec {Path.Combine(ptRelativePath, LyrebirdFileName)}";
     }
 
     private static string ApplySnowflakeAmpCache(OnionHopConnectOptions options, string pluginLine, Action<string> log)
@@ -1270,7 +1273,7 @@ internal sealed class TorBridgeManager
 
             if (string.Equals(transport, "snowflake", StringComparison.OrdinalIgnoreCase))
             {
-                plugins.Add($"ClientTransportPlugin snowflake exec {Path.Combine(ptRelativePath, SnowflakeClientFileName)}");
+                plugins.Add($"ClientTransportPlugin snowflake exec {Path.Combine(ptRelativePath, LyrebirdFileName)}");
                 continue;
             }
 

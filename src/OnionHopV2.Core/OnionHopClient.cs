@@ -1608,7 +1608,8 @@ public sealed class OnionHopClient : IDisposable
                 && !_snowflakeAmpHintShown
                 && _activeOptions is { UseTorBridges: true, UseSnowflakeAmp: false } options
                 && string.Equals(options.SelectedBridgeType, "snowflake", StringComparison.OrdinalIgnoreCase)
-                && line.Contains(PlatformHelper.SnowflakeClientBinaryName, StringComparison.OrdinalIgnoreCase)
+                && (line.Contains(PlatformHelper.SnowflakeClientBinaryName, StringComparison.OrdinalIgnoreCase)
+                    || line.Contains(PlatformHelper.LyrebirdBinaryName, StringComparison.OrdinalIgnoreCase))
                 && line.Contains("broker failure", StringComparison.OrdinalIgnoreCase))
             {
                 _snowflakeAmpHintShown = true;

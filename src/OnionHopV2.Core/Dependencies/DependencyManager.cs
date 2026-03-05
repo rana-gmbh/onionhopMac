@@ -197,10 +197,12 @@ internal sealed class DependencyManager
 
             if (!config.PluggableTransports.TryGetValue("snowflake", out var snowflakeLine)
                 || string.IsNullOrWhiteSpace(snowflakeLine)
-                || !snowflakeLine.Contains(snowflakeName, StringComparison.OrdinalIgnoreCase))
+                || (!snowflakeLine.Contains(lyrebirdName, StringComparison.OrdinalIgnoreCase)
+                    && !snowflakeLine.Contains(snowflakeName, StringComparison.OrdinalIgnoreCase)))
             {
+                // Lyrebird 0.8+ natively supports the snowflake transport.
                 config.PluggableTransports["snowflake"] =
-                    $"ClientTransportPlugin snowflake exec ${{pt_path}}{snowflakeName}";
+                    $"ClientTransportPlugin snowflake exec ${{pt_path}}{lyrebirdName}";
                 updated = true;
             }
 
