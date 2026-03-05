@@ -1528,7 +1528,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             HybridBypassApps = string.Empty;
 
             ThemeMode = ThemeModeSystem;
-            UseNativeTheme = false;
+            UseNativeTheme = true;
         }
         finally
         {

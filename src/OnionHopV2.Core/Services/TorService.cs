@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -67,7 +68,7 @@ internal sealed class TorService : IDisposable
         _dataDirectory = string.IsNullOrWhiteSpace(config.DataDirectory)
             ? Path.Combine(Path.GetTempPath(), "OnionHop", "tor-data")
             : config.DataDirectory;
-        Directory.CreateDirectory(_dataDirectory);
+        EnsureWritableDataDirectory(_dataDirectory);
 
         _controlPort = null;
         TryDeleteFile(Path.Combine(_dataDirectory, ControlPortFileName));
@@ -547,6 +548,66 @@ internal sealed class TorService : IDisposable
         }
         OutputReceived?.Invoke(sender, e);
     }
+
+    private void EnsureWritableDataDirectory(string path)
+    {
+        Directory.CreateDirectory(path);
+
+        // On macOS/Linux, if the directory was previously created by a root-elevated
+        // process, it may be owned by root and inaccessible to the current user.
+        // Detect this and attempt to reclaim ownership via chown, or fall back to
+        // recreating the directory.
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var testFile = Path.Combine(path, ".write_test");
+            try
+            {
+                File.WriteAllText(testFile, "");
+                File.Delete(testFile);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                _log($"Data directory '{path}' is not writable. Attempting to fix ownership...");
+                try
+                {
+                    var uid = geteuid();
+                    var gid = getegid();
+                    RecursiveChown(path, uid, gid);
+                    _log("Ownership fixed successfully.");
+                }
+                catch (Exception ex)
+                {
+                    _log($"Could not fix ownership ({ex.Message}). Deleting and recreating directory...");
+                    Directory.Delete(path, recursive: true);
+                    Directory.CreateDirectory(path);
+                }
+            }
+        }
+    }
+
+    private static void RecursiveChown(string path, uint uid, uint gid)
+    {
+        if (chown(path, uid, gid) != 0)
+            throw new IOException($"chown failed on '{path}'");
+
+        foreach (var dir in Directory.GetDirectories(path))
+            RecursiveChown(dir, uid, gid);
+
+        foreach (var file in Directory.GetFiles(path))
+        {
+            if (chown(file, uid, gid) != 0)
+                throw new IOException($"chown failed on '{file}'");
+        }
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int chown(string pathname, uint owner, uint group);
+
+    [DllImport("libc")]
+    private static extern uint geteuid();
+
+    [DllImport("libc")]
+    private static extern uint getegid();
 
     private static void TryDeleteFile(string path)
     {
