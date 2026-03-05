@@ -1102,8 +1102,10 @@ internal sealed class TorBridgeManager
         Action<string> log)
     {
         var ptPath = Path.Combine(torDir, "pluggable_transports");
-        var ptRelativePath = "pluggable_transports";
-        var ptRelativePathWithSlash = ptRelativePath + Path.DirectorySeparatorChar;
+        // Use absolute paths so pluggable transports are found regardless of
+        // working directory (critical when relaunched as root for TUN mode).
+        var ptRelativePath = ptPath;
+        var ptRelativePathWithSlash = ptPath + Path.DirectorySeparatorChar;
 
         var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var line in bridgeLines)
@@ -1447,7 +1449,7 @@ internal sealed class TorBridgeManager
             return false;
         }
 
-        pluginLine = $"ClientTransportPlugin webtunnel exec {Path.Combine("pluggable_transports", WebTunnelClientFileName)}";
+        pluginLine = $"ClientTransportPlugin webtunnel exec {Path.Combine(ptPath, WebTunnelClientFileName)}";
         return true;
     }
 
