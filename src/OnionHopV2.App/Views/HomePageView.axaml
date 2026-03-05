@@ -10,6 +10,7 @@
              x:Class="OnionHopV2.App.Views.HomePageView"
              x:DataType="vm:HomePageViewModel">
 
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
     <Grid Margin="24"
           RowDefinitions="Auto,Auto,Auto,Auto,Auto"
           RowSpacing="14">
@@ -259,4 +260,5 @@
             </StackPanel>
         </suki:GlassCard>
     </Grid>
+    </ScrollViewer>
 </UserControl>

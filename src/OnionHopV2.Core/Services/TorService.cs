@@ -553,34 +553,22 @@ internal sealed class TorService : IDisposable
     {
         Directory.CreateDirectory(path);
 
-        // On macOS/Linux, if the directory was previously created by a root-elevated
-        // process, it may be owned by root and inaccessible to the current user.
-        // Detect this and attempt to reclaim ownership via chown, or fall back to
-        // recreating the directory.
+        // On macOS/Linux, Tor strictly requires the data directory to be owned by the
+        // current user. When switching between proxy mode (normal user) and TUN/VPN mode
+        // (root), ownership mismatches in both directions. Always ensure correct ownership.
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            var testFile = Path.Combine(path, ".write_test");
+            var uid = geteuid();
+            var gid = getegid();
             try
             {
-                File.WriteAllText(testFile, "");
-                File.Delete(testFile);
+                RecursiveChown(path, uid, gid);
             }
-            catch (UnauthorizedAccessException)
+            catch (Exception ex)
             {
-                _log($"Data directory '{path}' is not writable. Attempting to fix ownership...");
-                try
-                {
-                    var uid = geteuid();
-                    var gid = getegid();
-                    RecursiveChown(path, uid, gid);
-                    _log("Ownership fixed successfully.");
-                }
-                catch (Exception ex)
-                {
-                    _log($"Could not fix ownership ({ex.Message}). Deleting and recreating directory...");
-                    Directory.Delete(path, recursive: true);
-                    Directory.CreateDirectory(path);
-                }
+                _log($"Could not fix ownership of '{path}' ({ex.Message}). Deleting and recreating directory...");
+                Directory.Delete(path, recursive: true);
+                Directory.CreateDirectory(path);
             }
         }
     }
