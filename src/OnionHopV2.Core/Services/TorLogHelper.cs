@@ -115,7 +115,10 @@ internal static class TorLogHelper
 
                 if (name.Contains('\\') || name.Contains('/'))
                 {
-                    name = Path.GetFileName(name);
+                    // Path.GetFileName doesn't handle backslashes on Unix,
+                    // so extract the filename manually for Windows-style paths.
+                    var lastSep = Math.Max(name.LastIndexOf('\\'), name.LastIndexOf('/'));
+                    name = lastSep >= 0 ? name[(lastSep + 1)..] : name;
                 }
 
                 if (!string.IsNullOrWhiteSpace(name))

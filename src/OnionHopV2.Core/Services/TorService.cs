@@ -68,7 +68,7 @@ internal sealed class TorService : IDisposable
         _dataDirectory = string.IsNullOrWhiteSpace(config.DataDirectory)
             ? Path.Combine(Path.GetTempPath(), "OnionHop", "tor-data")
             : config.DataDirectory;
-        EnsureWritableDataDirectory(_dataDirectory);
+        _dataDirectory = EnsureWritableDataDirectory(_dataDirectory);
 
         _controlPort = null;
         TryDeleteFile(Path.Combine(_dataDirectory, ControlPortFileName));
@@ -549,28 +549,119 @@ internal sealed class TorService : IDisposable
         OutputReceived?.Invoke(sender, e);
     }
 
-    private void EnsureWritableDataDirectory(string path)
+    private string EnsureWritableDataDirectory(string path)
     {
-        Directory.CreateDirectory(path);
-
         // On macOS/Linux, Tor strictly requires the data directory to be owned by the
         // current user. When switching between proxy mode (normal user) and TUN/VPN mode
-        // (root), ownership mismatches in both directions. Always ensure correct ownership.
+        // (root), ownership mismatches in both directions.
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            var uid = geteuid();
-            var gid = getegid();
+            path = EnsureWritableDataDirectoryUnix(path);
+        }
+        else
+        {
+            Directory.CreateDirectory(path);
+        }
+
+        return path;
+    }
+
+    private string EnsureWritableDataDirectoryUnix(string path)
+    {
+        var uid = geteuid();
+        var gid = getegid();
+
+        // Try the requested path first, then a temp-based fallback.
+        var candidates = new[]
+        {
+            path,
+            Path.Combine(Path.GetTempPath(), "OnionHop", $"tor-data-{uid}")
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (TryPrepareDataDirectory(candidate, uid, gid))
+            {
+                return candidate;
+            }
+        }
+
+        // Last resort: fresh unique temp directory (always writable by current user).
+        var fallback = Path.Combine(Path.GetTempPath(), $"OnionHop-tor-{uid}-{Environment.ProcessId}");
+        _log($"All data directory candidates failed. Using unique fallback: {fallback}");
+        Directory.CreateDirectory(fallback);
+        return fallback;
+    }
+
+    private bool TryPrepareDataDirectory(string path, uint uid, uint gid)
+    {
+        try
+        {
+            Directory.CreateDirectory(path);
+        }
+        catch (Exception ex)
+        {
+            _log($"Cannot create directory '{path}': {ex.Message}");
+            return false;
+        }
+
+        // Test actual write access — Directory.CreateDirectory succeeds on existing dirs
+        // even without write permission.
+        var testFile = Path.Combine(path, ".write-test");
+        try
+        {
+            File.WriteAllText(testFile, "test");
+            File.Delete(testFile);
+        }
+        catch
+        {
+            _log($"Directory '{path}' is not writable by current user (uid={uid}). Attempting fix...");
+
+            // Try to chown the directory.
             try
             {
                 RecursiveChown(path, uid, gid);
             }
-            catch (Exception ex)
+            catch
             {
-                _log($"Could not fix ownership of '{path}' ({ex.Message}). Deleting and recreating directory...");
-                Directory.Delete(path, recursive: true);
-                Directory.CreateDirectory(path);
+                // chown failed — try deleting and recreating.
+                _log($"chown failed on '{path}'. Attempting delete and recreate...");
+                try
+                {
+                    Directory.Delete(path, recursive: true);
+                    Directory.CreateDirectory(path);
+                }
+                catch (Exception delEx)
+                {
+                    _log($"Cannot reclaim '{path}': {delEx.Message}");
+                    return false;
+                }
+            }
+
+            // Verify write access after fix attempt.
+            try
+            {
+                File.WriteAllText(testFile, "test");
+                File.Delete(testFile);
+            }
+            catch
+            {
+                _log($"Directory '{path}' still not writable after fix attempt.");
+                return false;
             }
         }
+
+        // Ensure ownership is correct (Tor checks this).
+        try
+        {
+            RecursiveChown(path, uid, gid);
+        }
+        catch
+        {
+            // If we can write but can't chown, it's likely already owned by us.
+        }
+
+        return true;
     }
 
     private static void RecursiveChown(string path, uint uid, uint gid)

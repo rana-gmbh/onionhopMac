@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using OnionHopV2.Core.Dependencies;
@@ -901,9 +902,228 @@ public sealed class OnionHopClient : IDisposable
             return false;
         }
 
+        FixBaseDirectoryPermissions();
+
         _ptConfig = DependencyManager.TryLoadPluggableTransportConfig(_baseDir, RaiseLog);
         return true;
     }
+
+    private void FixBaseDirectoryPermissions()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || geteuid() == 0)
+        {
+            return;
+        }
+
+        // Check if any subdirectories are inaccessible (root-owned from a previous TUN session).
+        var dirsToFix = new List<string>();
+        foreach (var subDir in new[] { "tor", "vpn", "tor-data" })
+        {
+            var dirPath = Path.Combine(_baseDir, subDir);
+            if (!Directory.Exists(dirPath))
+            {
+                continue;
+            }
+
+            var testFile = Path.Combine(dirPath, ".write-test");
+            try
+            {
+                File.WriteAllText(testFile, "test");
+                File.Delete(testFile);
+            }
+            catch
+            {
+                dirsToFix.Add(dirPath);
+            }
+        }
+
+        if (dirsToFix.Count == 0)
+        {
+            return;
+        }
+
+        RaiseLog($"Detected {dirsToFix.Count} directory(ies) with wrong ownership. Requesting admin privileges to fix...");
+
+        // Use macOS osascript to prompt for admin password and fix permissions.
+        if (OperatingSystem.IsMacOS())
+        {
+            try
+            {
+                var uid = geteuid();
+                var userName = Environment.UserName;
+                var dirs = string.Join(" ", dirsToFix.Select(d => $"\\\"{d}\\\""));
+                var script = $"do shell script \"chown -R {userName}:staff {dirs} && chmod -R u+rwX {dirs}\" with administrator privileges";
+
+                var psi = new ProcessStartInfo("osascript", $"-e '{script}'")
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var proc = Process.Start(psi);
+                proc?.WaitForExit(30000);
+
+                if (proc?.ExitCode == 0)
+                {
+                    RaiseLog("Successfully fixed directory permissions.");
+                }
+                else
+                {
+                    var err = proc?.StandardError.ReadToEnd();
+                    RaiseLog($"Permission fix was declined or failed: {err}");
+                }
+            }
+            catch (Exception ex)
+            {
+                RaiseLog($"Failed to request permission fix: {ex.Message}");
+            }
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            // On Linux, try pkexec for a graphical sudo prompt.
+            try
+            {
+                var userName = Environment.UserName;
+                var dirs = string.Join(" ", dirsToFix.Select(d => $"\"{d}\""));
+                var psi = new ProcessStartInfo("pkexec", $"sh -c \"chown -R {userName} {dirs} && chmod -R u+rwX {dirs}\"")
+                {
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                using var proc = Process.Start(psi);
+                proc?.WaitForExit(30000);
+
+                if (proc?.ExitCode == 0)
+                {
+                    RaiseLog("Successfully fixed directory permissions.");
+                }
+                else
+                {
+                    RaiseLog("Permission fix was declined or failed.");
+                }
+            }
+            catch (Exception ex)
+            {
+                RaiseLog($"Failed to request permission fix: {ex.Message}");
+            }
+        }
+    }
+
+    private void FixBaseDirectoryOwnershipForNonRoot()
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        if (geteuid() != 0)
+        {
+            return; // Only makes sense when running as root.
+        }
+
+        // Use stat on the _baseDir to find the real user's uid/gid.
+        uint targetUid;
+        uint targetGid;
+        try
+        {
+            // stat the base directory — it should be owned by the real user
+            if (stat(_baseDir, out var baseStat) == 0)
+            {
+                targetUid = baseStat.st_uid;
+                targetGid = baseStat.st_gid;
+            }
+            else
+            {
+                // Fallback: use SUDO_UID/SUDO_GID environment variables
+                var sudoUid = Environment.GetEnvironmentVariable("SUDO_UID");
+                var sudoGid = Environment.GetEnvironmentVariable("SUDO_GID");
+                if (sudoUid == null || !uint.TryParse(sudoUid, out targetUid))
+                {
+                    return;
+                }
+                targetGid = sudoGid != null && uint.TryParse(sudoGid, out var gid) ? gid : targetUid;
+            }
+        }
+        catch
+        {
+            return;
+        }
+
+        if (targetUid == 0)
+        {
+            return; // Base dir is also root-owned; no user to restore to.
+        }
+
+        RaiseLog($"Fixing ownership of base directory subdirectories to uid={targetUid} gid={targetGid}");
+
+        foreach (var subDir in new[] { "tor", "vpn", "tor-data" })
+        {
+            var dirPath = Path.Combine(_baseDir, subDir);
+            if (!Directory.Exists(dirPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                RecursiveChmodAndChown(dirPath, targetUid, targetGid);
+            }
+            catch (Exception ex)
+            {
+                RaiseLog($"Warning: could not fix permissions on '{dirPath}': {ex.Message}");
+            }
+        }
+    }
+
+    private static void RecursiveChmodAndChown(string path, uint uid, uint gid)
+    {
+        chmod(path, 0b111_101_101); // 0755
+        chown(path, uid, gid);
+
+        foreach (var file in Directory.GetFiles(path))
+        {
+            var isExecutable = !Path.HasExtension(file)
+                || file.EndsWith(".dylib", StringComparison.OrdinalIgnoreCase)
+                || file.EndsWith(".so", StringComparison.OrdinalIgnoreCase);
+            chmod(file, isExecutable ? 0b111_101_101u : 0b110_100_100u); // 0755 or 0644
+            chown(file, uid, gid);
+        }
+
+        foreach (var dir in Directory.GetDirectories(path))
+        {
+            RecursiveChmodAndChown(dir, uid, gid);
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct StatBuf
+    {
+        public uint st_dev;
+        public ushort st_mode;
+        public ushort st_nlink;
+        public ulong st_ino;
+        public uint st_uid;
+        public uint st_gid;
+        // remaining fields not needed
+    }
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int chmod(string pathname, uint mode);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int chown(string pathname, uint owner, uint group);
+
+    [DllImport("libc", SetLastError = true, EntryPoint = "stat")]
+    private static extern int stat(string pathname, out StatBuf buf);
+
+    [DllImport("libc")]
+    private static extern uint geteuid();
+
+    [DllImport("libc")]
+    private static extern uint getegid();
 
     private async Task DisconnectCoreAsync(bool disableStatusUpdate)
     {
@@ -936,6 +1156,10 @@ public sealed class OnionHopClient : IDisposable
 
             StopTorProcess();
             await Task.Delay(250).ConfigureAwait(false);
+
+            // When disconnecting as root, fix ownership so the next non-root session
+            // can access tor binaries, libraries, and data files.
+            FixBaseDirectoryOwnershipForNonRoot();
         }
         finally
         {

@@ -396,7 +396,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private bool _autoUpdate;
     [ObservableProperty] private string _themeMode = ThemeModeSystem;
     [ObservableProperty] private bool _isDarkMode;
-    [ObservableProperty] private bool _useNativeTheme;
+    [ObservableProperty] private bool _useNativeTheme = true;
 
     [ObservableProperty] private string _statusMessage = string.Empty;
     [ObservableProperty] private string _connectionStatus = string.Empty;

@@ -273,14 +273,14 @@ internal sealed class TorBridgeManager
             .ToList()
             ?? [];
 
-        if (!bridgeKeys.Any(key => string.Equals(key, AutomaticBridgeType, StringComparison.OrdinalIgnoreCase)))
-        {
-            bridgeKeys.Add(AutomaticBridgeType);
-        }
-
         if (bridgeKeys.Count == 0)
         {
-            bridgeKeys.AddRange([AutomaticBridgeType, Obfs4BridgeType, SnowflakeBridgeType, ConjureBridgeType, "meek-azure"]);
+            bridgeKeys.AddRange([Obfs4BridgeType, SnowflakeBridgeType, ConjureBridgeType, "meek-azure"]);
+        }
+
+        if (!bridgeKeys.Any(key => string.Equals(key, AutomaticBridgeType, StringComparison.OrdinalIgnoreCase)))
+        {
+            bridgeKeys.Insert(0, AutomaticBridgeType);
         }
 
         if (!bridgeKeys.Any(key => string.Equals(key, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase)))
