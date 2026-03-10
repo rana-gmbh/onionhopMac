@@ -1351,11 +1351,10 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             }
 
             // Use osascript to run the app binary as root via the native macOS authorization dialog.
-            // "do shell script ... with administrator privileges" shows the standard password prompt.
-            // Escape backslashes and double-quotes for AppleScript string literal.
+            // Note: "do shell script ... with administrator privileges" uses macOS Security framework
+            // (AuthorizationCreate), which only shows a password dialog. Touch ID is not supported
+            // through this API — this is a macOS limitation, not an OnionHop limitation.
             var escapedPath = exePath.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            // Pass the current user's base directory so the root instance uses the same
-            // tor binary, geoip files, and data instead of root's empty home directory.
             var baseDir = currentBaseDirectory.Replace("\\", "\\\\").Replace("\"", "\\\"");
             var script = $"do shell script \"\\\"{escapedPath}\\\" --basedir \\\"{baseDir}\\\" > /tmp/onionhop-root.log 2>&1 & echo $!\" with administrator privileges";
 
@@ -1375,7 +1374,6 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                 return false;
             }
 
-            // Wait for osascript to finish (user enters password or cancels).
             proc.WaitForExit(120_000);
             var stdout = proc.StandardOutput.ReadToEnd().Trim();
             var stderr = proc.StandardError.ReadToEnd().Trim();

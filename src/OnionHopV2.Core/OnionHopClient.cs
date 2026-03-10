@@ -1026,20 +1026,47 @@ public sealed class OnionHopClient : IDisposable
             return; // Only makes sense when running as root.
         }
 
-        // Use stat on the _baseDir to find the real user's uid/gid.
+        // Determine the real user's uid/gid so we can restore ownership.
+        // Avoid P/Invoke stat() — the struct layout varies across OS/arch and causes crashes.
         uint targetUid;
         uint targetGid;
         try
         {
-            // stat the base directory — it should be owned by the real user
-            if (stat(_baseDir, out var baseStat) == 0)
+            // Try stat via shell command — safe across all platforms.
+            if (OperatingSystem.IsMacOS())
             {
-                targetUid = baseStat.st_uid;
-                targetGid = baseStat.st_gid;
+                // macOS stat: -f "%u %g" prints uid and gid
+                var output = PlatformHelper.RunCommand("stat", $"-f \"%u %g\" \"{_baseDir}\"");
+                var parts = output?.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts?.Length >= 2 && uint.TryParse(parts[0], out targetUid) && uint.TryParse(parts[1], out targetGid))
+                {
+                    // Successfully parsed uid/gid from stat
+                }
+                else
+                {
+                    targetUid = 0;
+                    targetGid = 0;
+                }
             }
             else
             {
-                // Fallback: use SUDO_UID/SUDO_GID environment variables
+                // Linux stat: -c "%u %g" prints uid and gid
+                var output = PlatformHelper.RunCommand("stat", $"-c \"%u %g\" \"{_baseDir}\"");
+                var parts = output?.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts?.Length >= 2 && uint.TryParse(parts[0], out targetUid) && uint.TryParse(parts[1], out targetGid))
+                {
+                    // Successfully parsed uid/gid from stat
+                }
+                else
+                {
+                    targetUid = 0;
+                    targetGid = 0;
+                }
+            }
+
+            // Fallback: use SUDO_UID/SUDO_GID environment variables
+            if (targetUid == 0)
+            {
                 var sudoUid = Environment.GetEnvironmentVariable("SUDO_UID");
                 var sudoGid = Environment.GetEnvironmentVariable("SUDO_GID");
                 if (sudoUid == null || !uint.TryParse(sudoUid, out targetUid))
@@ -1100,32 +1127,14 @@ public sealed class OnionHopClient : IDisposable
         }
     }
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct StatBuf
-    {
-        public uint st_dev;
-        public ushort st_mode;
-        public ushort st_nlink;
-        public ulong st_ino;
-        public uint st_uid;
-        public uint st_gid;
-        // remaining fields not needed
-    }
-
     [DllImport("libc", SetLastError = true)]
     private static extern int chmod(string pathname, uint mode);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int chown(string pathname, uint owner, uint group);
 
-    [DllImport("libc", SetLastError = true, EntryPoint = "stat")]
-    private static extern int stat(string pathname, out StatBuf buf);
-
     [DllImport("libc")]
     private static extern uint geteuid();
-
-    [DllImport("libc")]
-    private static extern uint getegid();
 
     private async Task DisconnectCoreAsync(bool disableStatusUpdate)
     {

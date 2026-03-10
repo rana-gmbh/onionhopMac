@@ -111,7 +111,6 @@ public partial class App : Application
             {
                 sukiWindow.IsTitleBarVisible = false;
                 sukiWindow.ShowTitlebarBackground = false;
-                sukiWindow.CanFullScreen = false;
                 sukiWindow.CanPin = false;
             }
 
