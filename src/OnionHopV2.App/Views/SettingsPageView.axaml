@@ -344,10 +344,10 @@
                                     </StackPanel>
 
                                     <Grid ColumnDefinitions="*,*"
-                                          ColumnSpacing="10">
+                                          ColumnSpacing="10"
+                                          IsVisible="{Binding State.ShowTunStackOptions}">
                                         <StackPanel Grid.Column="0"
-                                                    Spacing="6"
-                                                    IsVisible="{Binding State.ShowTunStackOptions}">
+                                                    Spacing="6">
                                             <TextBlock Text="{DynamicResource Settings.TunStack}" Opacity="0.75" />
                                             <ComboBox ItemsSource="{Binding State.TunStackModeOptions}"
                                                       SelectedItem="{Binding State.SelectedTunStackModeOption}" />
@@ -361,6 +361,14 @@
                                                      Watermark="{DynamicResource Settings.TunMtuWatermark}" />
                                         </StackPanel>
                                     </Grid>
+
+                                    <StackPanel Spacing="6"
+                                                IsVisible="{Binding !State.ShowTunStackOptions}">
+                                        <TextBlock Text="{DynamicResource Settings.TunMtu}" Opacity="0.75" />
+                                        <TextBox Text="{Binding State.TunMtu}"
+                                                 VerticalContentAlignment="Center"
+                                                 Watermark="{DynamicResource Settings.TunMtuWatermark}" />
+                                    </StackPanel>
 
                                     <ToggleSwitch Content="{DynamicResource Settings.TunStrictRoute}"
                                                   IsChecked="{Binding State.TunStrictRoute}" />

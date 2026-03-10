@@ -50,6 +50,7 @@ public sealed class OnionHopClient : IDisposable
 
     public event EventHandler<string>? Log;
     public event EventHandler<string>? DnsLog;
+    public event EventHandler<string>? VpnLog;
     public event EventHandler<StatusUpdate>? StatusUpdated;
     public event EventHandler<DependencyUpdate>? DependencyUpdated;
 
@@ -118,6 +119,7 @@ public sealed class OnionHopClient : IDisposable
 
         _singBoxLogProcessor.SetSourceLabel(_activeVpnCoreMode);
         _singBoxLogProcessor.LogReceived += RaiseLog;
+        _singBoxLogProcessor.LogReceived += RaiseVpnLog;
         _singBoxLogProcessor.DnsLogReceived += RaiseDnsLog;
         _singBoxLogProcessor.StatusMessageChanged += message =>
         {
@@ -1243,6 +1245,11 @@ public sealed class OnionHopClient : IDisposable
     private void RaiseDnsLog(string message)
     {
         DnsLog?.Invoke(this, message);
+    }
+
+    private void RaiseVpnLog(string message)
+    {
+        VpnLog?.Invoke(this, message);
     }
 
     private async Task<OnionHopConnectOptions> StartTorWithBridgeFallbackAsync(OnionHopConnectOptions options, CancellationToken token)

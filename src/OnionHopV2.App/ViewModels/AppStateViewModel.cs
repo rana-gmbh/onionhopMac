@@ -266,6 +266,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         _client = new OnionHopClient(Program.OverrideBaseDirectory);
         _client.Log += (_, message) => Dispatcher.UIThread.Post(() => AppendLog(message));
         _client.DnsLog += (_, message) => Dispatcher.UIThread.Post(() => AppendDnsLog(message));
+        _client.VpnLog += (_, message) => Dispatcher.UIThread.Post(() => AppendVpnLog(message));
         _client.StatusUpdated += (_, update) => Dispatcher.UIThread.Post(() => ApplyClientStatus(update));
         _client.DependencyUpdated += (_, update) => Dispatcher.UIThread.Post(() => ApplyDependencyUpdate(update));
         LastBridgeDbUpdateUtc = _client.GetLastBridgeDbUpdateUtc();
@@ -310,6 +311,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
 
     public ObservableCollection<string> LogLines { get; } = [];
     public ObservableCollection<string> DnsLogLines { get; } = [];
+    public ObservableCollection<string> VpnLogLines { get; } = [];
 
     [ObservableProperty] private string _downloadSpeed = "--";
     [ObservableProperty] private string _uploadSpeed = "--";
@@ -442,6 +444,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     public bool ShowWindowsOnlySettings => IsWindows;
     public bool ShowMacOnlySettings => IsMacOS;
     public bool ShowTunStackOptions => !IsMacOS;
+    public string VpnLogTabHeader => string.Equals(TunCoreMode, TunCoreXray, StringComparison.OrdinalIgnoreCase)
+        ? "xray"
+        : "sing-box";
     public bool CanUseOnionDnsProxy => PlatformHelper.IsAdministrator();
     public string ManualExitFingerprintSummary => BuildFingerprintSummary(ExitNodeFingerprint);
     public bool UseCustomChrome => !UseNativeTheme;
@@ -627,6 +632,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
 
         SelectedTunCoreModeOption = TunCoreModeOptions
             .FirstOrDefault(option => string.Equals(option.Value, normalized, StringComparison.Ordinal));
+        OnPropertyChanged(nameof(VpnLogTabHeader));
     }
 
     partial void OnSelectedTunCoreModeOptionChanged(LocalizedOption? value)
@@ -2620,6 +2626,19 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     {
         DnsLogLines.Clear();
         AppendDnsLog("DNS logs cleared.");
+    }
+
+    public void AppendVpnLog(string message)
+    {
+        var line = $"{DateTime.Now:HH:mm:ss} {message}";
+        VpnLogLines.Add(line);
+        TrimLogs(VpnLogLines);
+    }
+
+    public void ClearVpnLogs()
+    {
+        VpnLogLines.Clear();
+        AppendVpnLog("VPN engine logs cleared.");
     }
 
     private static void TrimLogs(ObservableCollection<string> list)

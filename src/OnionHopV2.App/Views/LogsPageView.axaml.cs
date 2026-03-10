@@ -76,14 +76,19 @@ public partial class LogsPageView : UserControl
             return;
         }
 
-        var tab = GetSelectedTabName();
-        if (string.Equals(tab, "DNS", StringComparison.OrdinalIgnoreCase))
+        var tabIndex = LogsTabs?.SelectedIndex ?? 0;
+        switch (tabIndex)
         {
-            state.ClearDnsLogs();
-            return;
+            case 1:
+                state.ClearDnsLogs();
+                break;
+            case 2:
+                state.ClearVpnLogs();
+                break;
+            default:
+                state.ClearAppLogs();
+                break;
         }
-
-        state.ClearAppLogs();
     }
 
     private string GetCurrentLogText()
@@ -94,10 +99,13 @@ public partial class LogsPageView : UserControl
             return string.Empty;
         }
 
-        var tab = GetSelectedTabName();
-        var lines = string.Equals(tab, "DNS", StringComparison.OrdinalIgnoreCase)
-            ? state.DnsLogLines
-            : state.LogLines;
+        var tabIndex = LogsTabs?.SelectedIndex ?? 0;
+        var lines = tabIndex switch
+        {
+            1 => state.DnsLogLines,
+            2 => state.VpnLogLines,
+            _ => state.LogLines
+        };
 
         return string.Join(Environment.NewLine, lines);
     }
