@@ -235,6 +235,30 @@ public static class PlatformHelper
         }
     }
 
+    internal static void RemoveQuarantineOnMacOS(string path)
+    {
+        if (!IsMac)
+        {
+            return;
+        }
+
+        try
+        {
+            if (File.Exists(path))
+            {
+                RunCommandSuccess("xattr", $"-d com.apple.quarantine \"{path}\"");
+            }
+            else if (Directory.Exists(path))
+            {
+                RunCommandSuccess("xattr", $"-cr \"{path}\"");
+            }
+        }
+        catch
+        {
+            // Best-effort
+        }
+    }
+
     private static class NativeMethods
     {
         [DllImport("libc", SetLastError = true)]

@@ -332,7 +332,10 @@ internal sealed class DependencyManager
             EnsureUnixExecutable(Path.Combine(ptDir, PlatformHelper.WebTunnelClientBinaryName));
             EnsureUnixExecutable(Path.Combine(ptDir, "conjure-client"));
 
-            // On macOS, ad-hoc codesign downloaded binaries so Gatekeeper allows execution
+            // On macOS, remove quarantine attributes and ad-hoc codesign downloaded
+            // binaries so Gatekeeper allows execution without manual xattr -cr.
+            PlatformHelper.RemoveQuarantineOnMacOS(torDir);
+            PlatformHelper.RemoveQuarantineOnMacOS(ptDir);
             AdHocCodesignOnMacOS(torPath);
             AdHocCodesignOnMacOS(torGenCertPath);
             AdHocCodesignOnMacOS(Path.Combine(ptDir, PlatformHelper.LyrebirdBinaryName));
@@ -451,6 +454,8 @@ internal sealed class DependencyManager
             Directory.CreateDirectory(Path.GetDirectoryName(destinationPath) ?? AppContext.BaseDirectory);
             File.Copy(binaryPath, destinationPath, true);
             EnsureUnixExecutable(destinationPath);
+            PlatformHelper.RemoveQuarantineOnMacOS(destinationPath);
+            AdHocCodesignOnMacOS(destinationPath);
         }).ConfigureAwait(false);
     }
 
