@@ -15,7 +15,9 @@ namespace OnionHopV2.Core.Services;
 internal sealed class VpnService : IDisposable
 {
     private readonly Action<string> _log;
+    private readonly object _processLock = new();
     private Process? _process;
+    private int? _lastExitCode;
     private bool _disposed;
 
     public VpnService(Action<string> log)
@@ -26,8 +28,8 @@ internal sealed class VpnService : IDisposable
     public event DataReceivedEventHandler? OutputReceived;
     public event EventHandler? Exited;
 
-    public bool IsRunning => _process != null && !_process.HasExited;
-    public int? ExitCode => _process?.HasExited == true ? _process.ExitCode : null;
+    public bool IsRunning { get { lock (_processLock) { return _process != null && !_process.HasExited; } } }
+    public int? ExitCode { get { lock (_processLock) { return _lastExitCode ?? (_process?.HasExited == true ? _process.ExitCode : null); } } }
 
     public async Task StartAsync(VpnLaunchConfig config, CancellationToken token)
     {
@@ -37,6 +39,7 @@ internal sealed class VpnService : IDisposable
         }
 
         Stop();
+        _lastExitCode = null;
         token.ThrowIfCancellationRequested();
 
         var vpnCoreMode = NormalizeTunCoreMode(config.VpnCoreMode);
@@ -135,27 +138,36 @@ internal sealed class VpnService : IDisposable
 
     public void Stop()
     {
-        if (_process == null)
+        Process? proc;
+        lock (_processLock)
         {
-            return;
+            proc = _process;
+            if (proc == null)
+            {
+                return;
+            }
+
+            _process = null;
         }
 
         try
         {
-            if (!_process.HasExited)
+            if (!proc.HasExited)
             {
                 try
                 {
-                    _process.CloseMainWindow();
-                    _process.WaitForExit(1500);
+                    proc.CloseMainWindow();
+                    proc.WaitForExit(1500);
                 }
                 catch
                 {
                 }
 
-                _process.Kill(true);
-                _process.WaitForExit(5000);
+                proc.Kill(true);
+                proc.WaitForExit(5000);
             }
+
+            _lastExitCode = proc.HasExited ? proc.ExitCode : null;
         }
         catch (Exception ex)
         {
@@ -163,11 +175,10 @@ internal sealed class VpnService : IDisposable
         }
         finally
         {
-            _process.OutputDataReceived -= HandleOutput;
-            _process.ErrorDataReceived -= HandleOutput;
-            _process.Exited -= HandleExited;
-            _process.Dispose();
-            _process = null;
+            proc.OutputDataReceived -= HandleOutput;
+            proc.ErrorDataReceived -= HandleOutput;
+            proc.Exited -= HandleExited;
+            proc.Dispose();
         }
     }
 

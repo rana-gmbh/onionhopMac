@@ -122,7 +122,9 @@ internal static class XrayConfigBuilder
         var resolvedTunMtu = tunMtu is >= 576 and <= 9000 ? tunMtu : null;
         var tunSettings = new Dictionary<string, object?>
         {
-            ["name"] = "OnionHop"
+            ["name"] = OperatingSystem.IsMacOS() ? "utun99" : "OnionHop",
+            ["address"] = new[] { "172.19.0.1/30" },
+            ["auto_route"] = true
         };
         if (resolvedTunMtu.HasValue)
         {
@@ -299,6 +301,7 @@ internal static class XrayConfigBuilder
             return
             [
                 "tor.exe",
+                "xray.exe",
                 "snowflake-client.exe",
                 "lyrebird.exe",
                 "obfs4proxy.exe",
@@ -310,6 +313,7 @@ internal static class XrayConfigBuilder
         return
         [
             "tor",
+            "xray",
             "snowflake-client",
             "lyrebird",
             "obfs4proxy",

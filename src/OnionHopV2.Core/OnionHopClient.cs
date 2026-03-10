@@ -1896,7 +1896,16 @@ public sealed class OnionHopClient : IDisposable
 
     private void OnSingBoxExited(object? sender, EventArgs e)
     {
-        var exitCode = _vpnService.ExitCode ?? 0;
+        int exitCode;
+        try
+        {
+            exitCode = _vpnService.ExitCode ?? 0;
+        }
+        catch
+        {
+            exitCode = -1;
+        }
+
         RaiseLog($"{_activeVpnCoreMode} exited with code {exitCode}.");
 
         if (_isConnected && _activeOptions is { } options && IsTunMode(options) && options.KillSwitchEnabled && !options.UseHybridRouting && !_isDisconnecting)
