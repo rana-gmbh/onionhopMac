@@ -216,18 +216,16 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           DMG_NAME="${{ env.APP_NAME }}-${VERSION}-macOS.dmg"
+          mkdir -p dist
 
-          # Create DMG
+          # Add Applications symlink so users can drag-to-install in one window
+          ln -s /Applications publish/Applications
+
+          # Create DMG with app + Applications shortcut side by side
           hdiutil create -volname "${{ env.APP_NAME }}" \
             -srcfolder publish \
             -ov -format UDZO \
-            "dist/${DMG_NAME}" || {
-              mkdir -p dist
-              hdiutil create -volname "${{ env.APP_NAME }}" \
-                -srcfolder publish \
-                -ov -format UDZO \
-                "dist/${DMG_NAME}"
-            }
+            "dist/${DMG_NAME}"
 
           # Sign DMG
           IDENTITY="Developer ID Application: Rana GmbH (${{ secrets.APPLE_TEAM_ID }})"
@@ -272,7 +270,7 @@ jobs:
 
             ### Installation
             1. Download the `.dmg` file below
-            2. Open the DMG and drag OnionHop to Applications
+            2. Open the DMG and drag OnionHop into the Applications folder
             3. Launch OnionHop from Applications
 
             ### What's included
