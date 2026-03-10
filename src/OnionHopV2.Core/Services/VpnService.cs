@@ -19,6 +19,7 @@ internal sealed class VpnService : IDisposable
     private Process? _process;
     private int? _lastExitCode;
     private bool _disposed;
+    private string? _xrayTunInterface;
 
     public VpnService(Action<string> log)
     {
@@ -171,10 +172,20 @@ internal sealed class VpnService : IDisposable
             throw new InvalidOperationException(
                 $"{vpnCoreLabel} exited unexpectedly during startup (exit code {_process.ExitCode}).\n{crashDetail}");
         }
+
+        // Xray creates the TUN interface but does NOT set up system routes (unlike sing-box auto_route).
+        // We must add routes manually so traffic actually flows through the tunnel.
+        if (string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal))
+        {
+            var tunName = OperatingSystem.IsMacOS() ? "utun99" : "OnionHop";
+            SetupXrayRoutes(tunName);
+        }
     }
 
     public void Stop()
     {
+        RemoveXrayRoutes();
+
         Process? proc;
         lock (_processLock)
         {
@@ -239,6 +250,60 @@ internal sealed class VpnService : IDisposable
     private void HandleOutput(object sender, DataReceivedEventArgs e)
     {
         OutputReceived?.Invoke(sender, e);
+    }
+
+    private void SetupXrayRoutes(string interfaceName)
+    {
+        try
+        {
+            if (OperatingSystem.IsMacOS())
+            {
+                PlatformHelper.RunCommandSuccess("route", $"add -net 0.0.0.0/1 -interface {interfaceName}");
+                PlatformHelper.RunCommandSuccess("route", $"add -net 128.0.0.0/1 -interface {interfaceName}");
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                PlatformHelper.RunCommandSuccess("ip", $"route add 0.0.0.0/1 dev {interfaceName}");
+                PlatformHelper.RunCommandSuccess("ip", $"route add 128.0.0.0/1 dev {interfaceName}");
+            }
+
+            _xrayTunInterface = interfaceName;
+            _log($"Added system routes via {interfaceName}");
+        }
+        catch (Exception ex)
+        {
+            _log($"Warning: failed to add system routes for xray TUN: {ex.Message}");
+        }
+    }
+
+    private void RemoveXrayRoutes()
+    {
+        var iface = _xrayTunInterface;
+        if (iface == null)
+        {
+            return;
+        }
+
+        _xrayTunInterface = null;
+        try
+        {
+            if (OperatingSystem.IsMacOS())
+            {
+                PlatformHelper.RunCommandSuccess("route", $"delete -net 0.0.0.0/1 -interface {iface}");
+                PlatformHelper.RunCommandSuccess("route", $"delete -net 128.0.0.0/1 -interface {iface}");
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                PlatformHelper.RunCommandSuccess("ip", $"route del 0.0.0.0/1 dev {iface}");
+                PlatformHelper.RunCommandSuccess("ip", $"route del 128.0.0.0/1 dev {iface}");
+            }
+
+            _log($"Removed system routes for {iface}");
+        }
+        catch
+        {
+            // Best effort — interface may already be gone.
+        }
     }
 
     private static string NormalizeTunCoreMode(string? value)

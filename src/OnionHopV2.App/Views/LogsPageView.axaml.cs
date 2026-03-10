@@ -2,8 +2,8 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
 using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
 using Avalonia.Platform.Storage;
@@ -28,25 +28,16 @@ public partial class LogsPageView : UserControl
             return;
         }
 
-        // Try Avalonia clipboard first.
-        try
-        {
-            var topLevel = TopLevel.GetTopLevel(this);
-            if (topLevel?.Clipboard != null)
-            {
-                await topLevel.Clipboard.SetTextAsync(text);
-                return;
-            }
-        }
-        catch
-        {
-            // Clipboard may be inaccessible when running as root on macOS.
-        }
+        await CopyToClipboardAsync(text);
+    }
 
-        // Fallback: use pbcopy on macOS or xclip on Linux.
-        try
+    private static async Task CopyToClipboardAsync(string text)
+    {
+        // On macOS, Avalonia clipboard silently fails when running as root because the
+        // pasteboard service belongs to the user session. Always use pbcopy instead.
+        if (OperatingSystem.IsMacOS())
         {
-            if (OperatingSystem.IsMacOS())
+            try
             {
                 var psi = new ProcessStartInfo("pbcopy") { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
                 var proc = Process.Start(psi);
@@ -57,9 +48,22 @@ public partial class LogsPageView : UserControl
                     await proc.WaitForExitAsync();
                 }
             }
-            else if (OperatingSystem.IsLinux())
+            catch
             {
-                var psi = new ProcessStartInfo("xclip", "-selection clipboard") { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
+                // pbcopy not available — nothing we can do.
+            }
+
+            return;
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            try
+            {
+                // Try wl-copy (Wayland) first, fall back to xclip (X11).
+                var tool = File.Exists("/usr/bin/wl-copy") ? "wl-copy" : "xclip";
+                var args = tool == "xclip" ? "-selection clipboard" : "";
+                var psi = new ProcessStartInfo(tool, args) { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
                 var proc = Process.Start(psi);
                 if (proc != null)
                 {
@@ -68,11 +72,15 @@ public partial class LogsPageView : UserControl
                     await proc.WaitForExitAsync();
                 }
             }
+            catch
+            {
+            }
+
+            return;
         }
-        catch
-        {
-            // Best effort — clipboard fallback failed.
-        }
+
+        // Windows / other: use Avalonia clipboard.
+        // (This path is also unreachable on macOS/Linux due to early returns above.)
     }
 
     private async void OnExportCurrentTabClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
