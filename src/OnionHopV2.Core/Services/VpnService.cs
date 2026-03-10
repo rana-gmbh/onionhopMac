@@ -122,7 +122,11 @@ internal sealed class VpnService : IDisposable
         _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
 
-        await Task.Delay(750, token);
+        // Wait longer for xray (it's slower to initialize than sing-box, especially with bridges).
+        var startupDelay = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
+            ? 2000
+            : 750;
+        await Task.Delay(startupDelay, token);
         if (_process.HasExited)
         {
             throw new InvalidOperationException($"{vpnCoreLabel} exited unexpectedly during startup.");

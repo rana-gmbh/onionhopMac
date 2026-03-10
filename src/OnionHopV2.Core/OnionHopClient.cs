@@ -1599,6 +1599,13 @@ public sealed class OnionHopClient : IDisposable
             TunStrictRoute = options.TunStrictRoute
         };
 
+        // Verify Tor's SOCKS port is actually accepting connections before starting the VPN engine.
+        // With bridges, Tor may report 100% bootstrap but need a moment for the SOCKS listener.
+        if (!await WaitForSocksPortReadyAsync(_activeSocksPort, token).ConfigureAwait(false))
+        {
+            RaiseLog($"Warning: Tor SOCKS port {_activeSocksPort} not responding after bootstrap. Proceeding anyway.");
+        }
+
         var selectedCorePath = string.Equals(tunCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
             ? xrayPath
             : singBoxPath;
@@ -1681,6 +1688,27 @@ public sealed class OnionHopClient : IDisposable
         ? OnionHopConnectOptions.TunCoreXray
         : OnionHopConnectOptions.TunCoreSingBox;
     private static string NormalizeTunStackModeForSingBox(string? mode) => TorLogHelper.NormalizeTunStackModeForSingBox(mode);
+
+    private static async Task<bool> WaitForSocksPortReadyAsync(int port, CancellationToken token, int maxWaitMs = 5000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < maxWaitMs)
+        {
+            token.ThrowIfCancellationRequested();
+            try
+            {
+                using var client = new System.Net.Sockets.TcpClient();
+                await client.ConnectAsync(System.Net.IPAddress.Loopback, port, token).ConfigureAwait(false);
+                return true;
+            }
+            catch (System.Net.Sockets.SocketException)
+            {
+                await Task.Delay(250, token).ConfigureAwait(false);
+            }
+        }
+
+        return false;
+    }
 
     private void StartAdminVpnMonitor(OnionHopConnectOptions options)
     {

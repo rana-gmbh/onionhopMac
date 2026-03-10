@@ -129,7 +129,7 @@ internal static class XrayConfigBuilder
             tunSettings["mtu"] = resolvedTunMtu.Value;
         }
 
-        var dnsServers = BuildDnsServers(secureDns, dohServer, dohServerPort, dohPath);
+        var dnsServers = BuildDnsServers(secureDns, socksPort, hybridRouting, dohServer, dohServerPort, dohPath);
 
         var outbounds = hybridRouting
             ? new object[]
@@ -243,11 +243,11 @@ internal static class XrayConfigBuilder
             .ToList();
     }
 
-    private static IReadOnlyList<string> BuildDnsServers(bool secureDns, string? dohServer, int dohServerPort, string? dohPath)
+    private static IReadOnlyList<object> BuildDnsServers(bool secureDns, int socksPort, bool hybridRouting, string? dohServer, int dohServerPort, string? dohPath)
     {
         if (!secureDns)
         {
-            return new[] { "1.1.1.1", "8.8.8.8" };
+            return new object[] { "1.1.1.1", "8.8.8.8" };
         }
 
         var resolvedHost = string.IsNullOrWhiteSpace(dohServer) ? "cloudflare-dns.com" : dohServer.Trim();
@@ -257,18 +257,39 @@ internal static class XrayConfigBuilder
             resolvedPath = "/" + resolvedPath;
         }
 
+        string dohUrl;
         if (resolvedHost.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
         {
-            return new[] { resolvedHost };
+            dohUrl = resolvedHost;
         }
-
-        if (resolvedHost.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        else if (resolvedHost.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
         {
-            return new[] { "https://" + resolvedHost.Substring("http://".Length) };
+            dohUrl = "https://" + resolvedHost.Substring("http://".Length);
+        }
+        else
+        {
+            var resolvedPort = dohServerPort is > 0 and <= 65535 ? dohServerPort : 443;
+            dohUrl = $"https://{resolvedHost}:{resolvedPort}{resolvedPath}";
         }
 
-        var resolvedPort = dohServerPort is > 0 and <= 65535 ? dohServerPort : 443;
-        return new[] { $"https://{resolvedHost}:{resolvedPort}{resolvedPath}" };
+        var servers = new List<object>();
+
+        // Xray needs a bootstrap plaintext DNS to resolve the DoH hostname.
+        // Without this, xray crashes when the DoH server is a hostname (e.g. cloudflare-dns.com)
+        // because it has no way to resolve the initial DNS connection, especially with bridges.
+        var hostIsIp = System.Net.IPAddress.TryParse(resolvedHost, out _);
+        if (!hostIsIp)
+        {
+            servers.Add(new
+            {
+                address = "1.1.1.1",
+                domains = new[] { resolvedHost }
+            });
+        }
+
+        servers.Add(dohUrl);
+
+        return servers;
     }
 
     private static string[] BuildTorRelatedProcessNames()
