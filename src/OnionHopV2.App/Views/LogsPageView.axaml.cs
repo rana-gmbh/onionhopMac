@@ -1,6 +1,8 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
@@ -26,13 +28,51 @@ public partial class LogsPageView : UserControl
             return;
         }
 
-        var topLevel = TopLevel.GetTopLevel(this);
-        if (topLevel?.Clipboard == null)
+        // Try Avalonia clipboard first.
+        try
         {
-            return;
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel?.Clipboard != null)
+            {
+                await topLevel.Clipboard.SetTextAsync(text);
+                return;
+            }
+        }
+        catch
+        {
+            // Clipboard may be inaccessible when running as root on macOS.
         }
 
-        await topLevel.Clipboard.SetTextAsync(text);
+        // Fallback: use pbcopy on macOS or xclip on Linux.
+        try
+        {
+            if (OperatingSystem.IsMacOS())
+            {
+                var psi = new ProcessStartInfo("pbcopy") { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
+                var proc = Process.Start(psi);
+                if (proc != null)
+                {
+                    await proc.StandardInput.WriteAsync(text);
+                    proc.StandardInput.Close();
+                    await proc.WaitForExitAsync();
+                }
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                var psi = new ProcessStartInfo("xclip", "-selection clipboard") { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
+                var proc = Process.Start(psi);
+                if (proc != null)
+                {
+                    await proc.StandardInput.WriteAsync(text);
+                    proc.StandardInput.Close();
+                    await proc.WaitForExitAsync();
+                }
+            }
+        }
+        catch
+        {
+            // Best effort — clipboard fallback failed.
+        }
     }
 
     private async void OnExportCurrentTabClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
