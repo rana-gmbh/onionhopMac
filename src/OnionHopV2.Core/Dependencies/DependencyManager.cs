@@ -62,7 +62,9 @@ internal sealed class DependencyManager
 
         progress(new DependencyUpdate(true, "Preparing downloads...", 0));
 
-        var tempRoot = Path.Combine(Path.GetTempPath(), "OnionHop", "deps");
+        // Use a unique temp directory per run to avoid permission conflicts when the
+        // app relaunches as root (root-owned leftovers would block the normal user).
+        var tempRoot = Path.Combine(Path.GetTempPath(), "OnionHop", $"deps-{Environment.ProcessId}");
         try
         {
             Directory.CreateDirectory(tempRoot);
