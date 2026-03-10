@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
+using OnionHopV2.Core.Platform;
 
 namespace OnionHopV2.Core.Services;
 
@@ -144,65 +145,35 @@ internal static class XrayConfigBuilder
 
         var dnsServers = BuildDnsServers(secureDns, socksPort, hybridRouting, dohServer, dohServerPort, dohPath);
 
-        var outbounds = hybridRouting
-            ? new object[]
+        // Detect the default network interface so xray can bind outbound sockets to it
+        // via IP_BOUND_IF, preventing a routing loop when TUN routes capture all traffic.
+        var defaultInterface = DetectDefaultInterface();
+
+        var directOutbound = new Dictionary<string, object?> { ["protocol"] = "freedom", ["tag"] = "direct" };
+        var torOutbound = new Dictionary<string, object?>
+        {
+            ["protocol"] = "socks",
+            ["tag"] = "tor",
+            ["settings"] = new
             {
-                new
+                servers = new[]
                 {
-                    protocol = "freedom",
-                    tag = "direct"
-                },
-                new
-                {
-                    protocol = "socks",
-                    tag = "tor",
-                    settings = new
-                    {
-                        servers = new[]
-                        {
-                            new
-                            {
-                                address = "127.0.0.1",
-                                port = socksPort
-                            }
-                        }
-                    }
-                },
-                new
-                {
-                    protocol = "blackhole",
-                    tag = "block"
+                    new { address = "127.0.0.1", port = socksPort }
                 }
             }
-            : new object[]
-            {
-                new
-                {
-                    protocol = "socks",
-                    tag = "tor",
-                    settings = new
-                    {
-                        servers = new[]
-                        {
-                            new
-                            {
-                                address = "127.0.0.1",
-                                port = socksPort
-                            }
-                        }
-                    }
-                },
-                new
-                {
-                    protocol = "freedom",
-                    tag = "direct"
-                },
-                new
-                {
-                    protocol = "blackhole",
-                    tag = "block"
-                }
-            };
+        };
+        var blockOutbound = new Dictionary<string, object?> { ["protocol"] = "blackhole", ["tag"] = "block" };
+
+        if (!string.IsNullOrEmpty(defaultInterface))
+        {
+            var streamSettings = new { sockopt = new { @interface = defaultInterface } };
+            directOutbound["streamSettings"] = streamSettings;
+            torOutbound["streamSettings"] = streamSettings;
+        }
+
+        var outbounds = hybridRouting
+            ? new object[] { directOutbound, torOutbound, blockOutbound }
+            : new object[] { torOutbound, directOutbound, blockOutbound };
 
         var config = new
         {
@@ -303,6 +274,53 @@ internal static class XrayConfigBuilder
         servers.Add(dohUrl);
 
         return servers;
+    }
+
+    private static string? DetectDefaultInterface()
+    {
+        try
+        {
+            if (OperatingSystem.IsMacOS())
+            {
+                var output = PlatformHelper.RunCommand("route", "-n get default");
+                if (output != null)
+                {
+                    foreach (var line in output.Split('\n'))
+                    {
+                        var trimmed = line.Trim();
+                        if (trimmed.StartsWith("interface:", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var iface = trimmed.Substring("interface:".Length).Trim();
+                            if (!string.IsNullOrEmpty(iface))
+                            {
+                                return iface;
+                            }
+                        }
+                    }
+                }
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                var output = PlatformHelper.RunCommand("ip", "route show default");
+                if (output != null)
+                {
+                    // "default via X.X.X.X dev eth0 ..."
+                    var parts = output.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    for (var i = 0; i < parts.Length - 1; i++)
+                    {
+                        if (string.Equals(parts[i], "dev", StringComparison.Ordinal))
+                        {
+                            return parts[i + 1];
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
     }
 
     private static string[] BuildTorRelatedProcessNames()

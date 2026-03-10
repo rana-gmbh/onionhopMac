@@ -31,15 +31,47 @@ public partial class LogsPageView : UserControl
         await CopyToClipboardAsync(text);
     }
 
-    private static async Task CopyToClipboardAsync(string text)
+    private async Task CopyToClipboardAsync(string text)
     {
-        // On macOS, Avalonia clipboard silently fails when running as root because the
-        // pasteboard service belongs to the user session. Always use pbcopy instead.
         if (OperatingSystem.IsMacOS())
         {
+            // On macOS as root, Avalonia clipboard and pbcopy can't access the user's pasteboard.
+            // Use osascript which routes through Apple Events and works regardless of privilege level.
             try
             {
-                var psi = new ProcessStartInfo("pbcopy") { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
+                // Write to temp file to avoid shell escaping issues with arbitrary log text.
+                var tempFile = Path.Combine(Path.GetTempPath(), $"onionhop-clip-{Environment.ProcessId}.txt");
+                await File.WriteAllTextAsync(tempFile, text);
+                var psi = new ProcessStartInfo("/usr/bin/osascript")
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add("-e");
+                psi.ArgumentList.Add($"set the clipboard to (read POSIX file \"{tempFile}\" as «class utf8»)");
+                var proc = Process.Start(psi);
+                if (proc != null)
+                {
+                    await proc.WaitForExitAsync();
+                }
+
+                try { File.Delete(tempFile); } catch { }
+
+                if (proc?.ExitCode == 0)
+                {
+                    return;
+                }
+            }
+            catch
+            {
+            }
+
+            // Fallback: try pbcopy directly.
+            try
+            {
+                var psi = new ProcessStartInfo("/usr/bin/pbcopy") { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
                 var proc = Process.Start(psi);
                 if (proc != null)
                 {
@@ -50,17 +82,16 @@ public partial class LogsPageView : UserControl
             }
             catch
             {
-                // pbcopy not available — nothing we can do.
             }
 
             return;
         }
 
+        // Linux: use wl-copy or xclip.
         if (OperatingSystem.IsLinux())
         {
             try
             {
-                // Try wl-copy (Wayland) first, fall back to xclip (X11).
                 var tool = File.Exists("/usr/bin/wl-copy") ? "wl-copy" : "xclip";
                 var args = tool == "xclip" ? "-selection clipboard" : "";
                 var psi = new ProcessStartInfo(tool, args) { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
@@ -80,7 +111,17 @@ public partial class LogsPageView : UserControl
         }
 
         // Windows / other: use Avalonia clipboard.
-        // (This path is also unreachable on macOS/Linux due to early returns above.)
+        try
+        {
+            var topLevel = TopLevel.GetTopLevel(this);
+            if (topLevel?.Clipboard != null)
+            {
+                await topLevel.Clipboard.SetTextAsync(text);
+            }
+        }
+        catch
+        {
+        }
     }
 
     private async void OnExportCurrentTabClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
