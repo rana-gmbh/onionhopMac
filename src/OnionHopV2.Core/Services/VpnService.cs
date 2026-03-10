@@ -95,6 +95,7 @@ internal sealed class VpnService : IDisposable
         await File.WriteAllTextAsync(configPath, configJson, token);
 
         _log($"Starting {vpnCoreLabel} with config: {configPath}");
+        _log($"{vpnCoreLabel} config:\n{configJson}");
 
         var psi = new ProcessStartInfo(vpnCorePath, $"run -c \"{configPath}\"")
         {
@@ -105,6 +106,19 @@ internal sealed class VpnService : IDisposable
             WorkingDirectory = workDir
         };
 
+        // Capture startup output for crash diagnostics.
+        var startupLines = new List<string>();
+        void CaptureStartupOutput(object s, DataReceivedEventArgs args)
+        {
+            if (!string.IsNullOrWhiteSpace(args.Data))
+            {
+                lock (startupLines)
+                {
+                    startupLines.Add(args.Data);
+                }
+            }
+        }
+
         _process = new Process
         {
             StartInfo = psi,
@@ -113,7 +127,9 @@ internal sealed class VpnService : IDisposable
 
         _process.Exited += HandleExited;
         _process.OutputDataReceived += HandleOutput;
+        _process.OutputDataReceived += CaptureStartupOutput;
         _process.ErrorDataReceived += HandleOutput;
+        _process.ErrorDataReceived += CaptureStartupOutput;
 
         if (!_process.Start())
         {
@@ -130,9 +146,30 @@ internal sealed class VpnService : IDisposable
             ? 2000
             : 750;
         await Task.Delay(startupDelay, token);
+
+        // Detach startup capture.
+        try
+        {
+            _process.OutputDataReceived -= CaptureStartupOutput;
+            _process.ErrorDataReceived -= CaptureStartupOutput;
+        }
+        catch
+        {
+        }
+
         if (_process.HasExited)
         {
-            throw new InvalidOperationException($"{vpnCoreLabel} exited unexpectedly during startup.");
+            string crashDetail;
+            lock (startupLines)
+            {
+                crashDetail = startupLines.Count > 0
+                    ? string.Join("\n", startupLines)
+                    : "(no output captured)";
+            }
+
+            _log($"{vpnCoreLabel} crash output:\n{crashDetail}");
+            throw new InvalidOperationException(
+                $"{vpnCoreLabel} exited unexpectedly during startup (exit code {_process.ExitCode}).\n{crashDetail}");
         }
     }
 

@@ -120,15 +120,15 @@ internal static class XrayConfigBuilder
         }
 
         var resolvedTunMtu = tunMtu is >= 576 and <= 9000 ? tunMtu : null;
+        // Xray TUN inbound uses different field names from sing-box.
+        // Only "name" and "MTU" (uppercase) are recognized by xray-core.
         var tunSettings = new Dictionary<string, object?>
         {
-            ["name"] = OperatingSystem.IsMacOS() ? "utun99" : "OnionHop",
-            ["address"] = new[] { "172.19.0.1/30" },
-            ["auto_route"] = true
+            ["name"] = OperatingSystem.IsMacOS() ? "utun99" : "OnionHop"
         };
         if (resolvedTunMtu.HasValue)
         {
-            tunSettings["mtu"] = resolvedTunMtu.Value;
+            tunSettings["MTU"] = resolvedTunMtu.Value;
         }
 
         var dnsServers = BuildDnsServers(secureDns, socksPort, hybridRouting, dohServer, dohServerPort, dohPath);

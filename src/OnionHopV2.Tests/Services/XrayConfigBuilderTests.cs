@@ -99,7 +99,7 @@ public sealed class XrayConfigBuilderTests
             tunMtu: 1420);
         var withMtuDoc = JsonDocument.Parse(withMtuJson);
         var withMtuSettings = withMtuDoc.RootElement.GetProperty("inbounds")[0].GetProperty("settings");
-        Assert.Equal(1420, withMtuSettings.GetProperty("mtu").GetInt32());
+        Assert.Equal(1420, withMtuSettings.GetProperty("MTU").GetInt32());
 
         var invalidMtuJson = XrayConfigBuilder.BuildJson(
             hybridRouting: false,
@@ -115,6 +115,6 @@ public sealed class XrayConfigBuilderTests
             tunMtu: 120);
         var invalidMtuDoc = JsonDocument.Parse(invalidMtuJson);
         var invalidMtuSettings = invalidMtuDoc.RootElement.GetProperty("inbounds")[0].GetProperty("settings");
-        Assert.False(invalidMtuSettings.TryGetProperty("mtu", out _));
+        Assert.False(invalidMtuSettings.TryGetProperty("MTU", out _));
     }
 }
