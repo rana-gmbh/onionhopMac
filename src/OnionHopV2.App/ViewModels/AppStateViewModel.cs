@@ -1351,9 +1351,6 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             }
 
             // Use osascript to run the app binary as root via the native macOS authorization dialog.
-            // Note: "do shell script ... with administrator privileges" uses macOS Security framework
-            // (AuthorizationCreate), which only shows a password dialog. Touch ID is not supported
-            // through this API — this is a macOS limitation, not an OnionHop limitation.
             var escapedPath = exePath.Replace("\\", "\\\\").Replace("\"", "\\\"");
             var baseDir = currentBaseDirectory.Replace("\\", "\\\\").Replace("\"", "\\\"");
             var script = $"do shell script \"\\\"{escapedPath}\\\" --basedir \\\"{baseDir}\\\" > /tmp/onionhop-root.log 2>&1 & echo $!\" with administrator privileges";
@@ -1374,9 +1371,12 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                 return false;
             }
 
+            // Read stdout/stderr asynchronously to avoid deadlock with WaitForExit.
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
             proc.WaitForExit(120_000);
-            var stdout = proc.StandardOutput.ReadToEnd().Trim();
-            var stderr = proc.StandardError.ReadToEnd().Trim();
+            var stdout = stdoutTask.GetAwaiter().GetResult().Trim();
+            var stderr = stderrTask.GetAwaiter().GetResult().Trim();
             OnionHopV2.Core.Services.StartupLogger.Write($"osascript exit={proc.ExitCode}, stdout='{stdout}', stderr='{stderr}'");
             return proc.ExitCode == 0;
         }

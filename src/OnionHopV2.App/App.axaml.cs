@@ -103,9 +103,21 @@ public partial class App : Application
         if (useNativeChrome)
         {
             window.SystemDecorations = SystemDecorations.Full;
-            window.ExtendClientAreaToDecorationsHint = false;
             window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.Default;
-            window.ExtendClientAreaTitleBarHeightHint = 0;
+            window.ExtendClientAreaTitleBarHeightHint = -1; // use default OS title bar height
+
+            if (OperatingSystem.IsMacOS())
+            {
+                // On macOS, extend client area into title bar so the traffic light buttons
+                // (close/minimize/maximize) overlay on our content — standard macOS app behavior.
+                window.ExtendClientAreaToDecorationsHint = true;
+                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.PreferSystemChrome;
+                window.ExtendClientAreaTitleBarHeightHint = 38;
+            }
+            else
+            {
+                window.ExtendClientAreaToDecorationsHint = false;
+            }
 
             if (window is SukiWindow sukiWindow)
             {

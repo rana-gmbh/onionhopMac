@@ -35,13 +35,14 @@ public partial class LogsPageView : UserControl
     {
         if (OperatingSystem.IsMacOS())
         {
-            // On macOS as root, Avalonia clipboard and pbcopy can't access the user's pasteboard.
-            // Use osascript which routes through Apple Events and works regardless of privilege level.
+            // On macOS, Avalonia clipboard and pbcopy don't work reliably when running as root.
+            // Write text to a temp file, then use osascript "do shell script" to read it into the clipboard.
+            // osascript accesses the pasteboard through Apple Events, which works across privilege levels.
             try
             {
-                // Write to temp file to avoid shell escaping issues with arbitrary log text.
                 var tempFile = Path.Combine(Path.GetTempPath(), $"onionhop-clip-{Environment.ProcessId}.txt");
                 await File.WriteAllTextAsync(tempFile, text);
+
                 var psi = new ProcessStartInfo("/usr/bin/osascript")
                 {
                     UseShellExecute = false,
@@ -50,7 +51,7 @@ public partial class LogsPageView : UserControl
                     CreateNoWindow = true
                 };
                 psi.ArgumentList.Add("-e");
-                psi.ArgumentList.Add($"set the clipboard to (read POSIX file \"{tempFile}\" as «class utf8»)");
+                psi.ArgumentList.Add($"set the clipboard to (do shell script \"cat '{tempFile}'\")");
                 var proc = Process.Start(psi);
                 if (proc != null)
                 {
@@ -58,27 +59,7 @@ public partial class LogsPageView : UserControl
                 }
 
                 try { File.Delete(tempFile); } catch { }
-
-                if (proc?.ExitCode == 0)
-                {
-                    return;
-                }
-            }
-            catch
-            {
-            }
-
-            // Fallback: try pbcopy directly.
-            try
-            {
-                var psi = new ProcessStartInfo("/usr/bin/pbcopy") { RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true };
-                var proc = Process.Start(psi);
-                if (proc != null)
-                {
-                    await proc.StandardInput.WriteAsync(text);
-                    proc.StandardInput.Close();
-                    await proc.WaitForExitAsync();
-                }
+                return;
             }
             catch
             {
@@ -87,7 +68,6 @@ public partial class LogsPageView : UserControl
             return;
         }
 
-        // Linux: use wl-copy or xclip.
         if (OperatingSystem.IsLinux())
         {
             try
@@ -110,7 +90,7 @@ public partial class LogsPageView : UserControl
             return;
         }
 
-        // Windows / other: use Avalonia clipboard.
+        // Windows: use Avalonia clipboard.
         try
         {
             var topLevel = TopLevel.GetTopLevel(this);

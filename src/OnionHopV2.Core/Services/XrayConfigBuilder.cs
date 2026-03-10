@@ -164,11 +164,12 @@ internal static class XrayConfigBuilder
         };
         var blockOutbound = new Dictionary<string, object?> { ["protocol"] = "blackhole", ["tag"] = "block" };
 
+        // Bind only the "direct" outbound to the real network interface (e.g. en0) via IP_BOUND_IF.
+        // This prevents xray's direct outbound traffic from being captured by the TUN routes.
+        // Do NOT bind "tor" — it connects to 127.0.0.1 which is only reachable via loopback.
         if (!string.IsNullOrEmpty(defaultInterface))
         {
-            var streamSettings = new { sockopt = new { @interface = defaultInterface } };
-            directOutbound["streamSettings"] = streamSettings;
-            torOutbound["streamSettings"] = streamSettings;
+            directOutbound["streamSettings"] = new { sockopt = new { @interface = defaultInterface } };
         }
 
         var outbounds = hybridRouting
