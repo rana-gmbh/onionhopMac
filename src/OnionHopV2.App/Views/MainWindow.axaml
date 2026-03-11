@@ -103,15 +103,14 @@
             </suki:SukiSideMenu.FooterContent>
         </suki:SukiSideMenu>
 
-        <!-- Custom title bar drag region — spans full width, sits above all content -->
+        <!-- Custom title bar for non-native chrome -->
         <Border IsVisible="{Binding State.UseCustomChrome}"
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Top"
                 Height="38"
-                Margin="0,4,10,0"
+                Margin="10,10,10,0"
                 CornerRadius="0"
                 Background="Transparent"
-                ZIndex="100"
                 PointerPressed="OnDragRegionPointerPressed">
             <Grid ColumnDefinitions="*,Auto">
                 <StackPanel Grid.Column="1"

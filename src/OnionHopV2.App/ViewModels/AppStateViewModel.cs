@@ -450,9 +450,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         : "sing-box";
     public bool CanUseOnionDnsProxy => PlatformHelper.IsAdministrator();
     public string ManualExitFingerprintSummary => BuildFingerprintSummary(ExitNodeFingerprint);
-    // macOS: always use custom chrome — SukiWindow doesn't properly expose native traffic light buttons.
-    public bool UseCustomChrome => OperatingSystem.IsMacOS() || !UseNativeTheme;
-    public bool SupportsNativeWindowChrome => !OperatingSystem.IsMacOS();
+    public bool UseCustomChrome => !UseNativeTheme;
+    public bool SupportsNativeWindowChrome => true;
     public bool CanConfigureSplitTunneling => IsTunMode && UseHybridRouting;
     public string BridgeDbLastUpdateText
     {

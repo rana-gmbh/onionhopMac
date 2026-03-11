@@ -100,13 +100,25 @@ public partial class App : Application
     {
         var wasMaximized = window.WindowState == WindowState.Maximized;
 
-        if (useNativeChrome && !OperatingSystem.IsMacOS())
+        if (useNativeChrome)
         {
-            // Native chrome on Windows/Linux — show OS title bar and decorations.
             window.SystemDecorations = SystemDecorations.Full;
-            window.ExtendClientAreaToDecorationsHint = false;
-            window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.Default;
-            window.ExtendClientAreaTitleBarHeightHint = -1;
+
+            if (OperatingSystem.IsMacOS())
+            {
+                // macOS: extend content into the title bar area so the native traffic light
+                // buttons (close/minimize/fullscreen) overlay on window content.
+                // PreferSystemChrome ensures the traffic lights are shown.
+                window.ExtendClientAreaToDecorationsHint = true;
+                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.PreferSystemChrome;
+                window.ExtendClientAreaTitleBarHeightHint = 38;
+            }
+            else
+            {
+                window.ExtendClientAreaToDecorationsHint = false;
+                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.Default;
+                window.ExtendClientAreaTitleBarHeightHint = -1;
+            }
 
             if (window is SukiWindow sukiWindow)
             {
