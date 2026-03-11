@@ -1328,16 +1328,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                     ? "tunnel setup"
                     : ".onion DNS setup";
 
-            StatusMessage = LocalizationService.Get("Status.AdminRequiredRequesting");
-            AppendLog($"Requesting macOS administrator privileges before {adminReason}. The GUI stays in the normal user session.");
-
-            if (!await _client.EnsureMacAdministratorAccessAsync(_connectCts?.Token ?? CancellationToken.None))
-            {
-                StatusMessage = LocalizationService.Get("Status.AdminRequiredCanceled");
-                return false;
-            }
-
-            AppendLog("macOS administrator privileges granted. Proceeding with connection setup.");
+            AppendLog($"macOS will request administrator privileges when starting {adminReason}. The GUI stays in the normal user session.");
             return true;
         }
 

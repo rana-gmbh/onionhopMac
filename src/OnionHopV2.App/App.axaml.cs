@@ -106,12 +106,9 @@ public partial class App : Application
 
             if (OperatingSystem.IsMacOS())
             {
-                // macOS: extend content into the title bar area so the native traffic light
-                // buttons (close/minimize/fullscreen) overlay on window content.
-                // PreferSystemChrome ensures the traffic lights are shown.
-                window.ExtendClientAreaToDecorationsHint = true;
-                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.PreferSystemChrome | ExtendClientAreaChromeHints.OSXThickTitleBar;
-                window.ExtendClientAreaTitleBarHeightHint = 56;
+                window.ExtendClientAreaToDecorationsHint = false;
+                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.Default;
+                window.ExtendClientAreaTitleBarHeightHint = -1;
             }
             else
             {

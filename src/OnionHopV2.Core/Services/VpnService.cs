@@ -30,6 +30,7 @@ internal sealed class VpnService : IDisposable
     private string? _macPrivilegedExitCodePath;
     private string? _macPrivilegedCoreMode;
     private string? _macPrivilegedTunInterface;
+    private bool _macPrivilegedManagesOnionResolver;
     private long _macPrivilegedLogOffset;
 
     public VpnService(Action<string> log)
@@ -138,6 +139,8 @@ internal sealed class VpnService : IDisposable
                 vpnCoreLabel,
                 workDir,
                 configPath,
+                config.ManageOnionResolver,
+                config.OnionDnsNameServer,
                 startupDelay,
                 token).ConfigureAwait(false);
             return;
@@ -364,6 +367,8 @@ internal sealed class VpnService : IDisposable
         string vpnCoreLabel,
         string workDir,
         string configPath,
+        bool manageOnionResolver,
+        string? onionDnsNameServer,
         int startupDelayMs,
         CancellationToken token)
     {
@@ -398,6 +403,8 @@ internal sealed class VpnService : IDisposable
                 supervisorPidPath,
                 corePidPath,
                 exitCodePath,
+                manageOnionResolver,
+                onionDnsNameServer,
                 tunInterface,
                 startupDelayMs),
             requireAdministrator: true,
@@ -416,6 +423,7 @@ internal sealed class VpnService : IDisposable
         _macPrivilegedExitCodePath = exitCodePath;
         _macPrivilegedCoreMode = vpnCoreMode;
         _macPrivilegedTunInterface = tunInterface;
+        _macPrivilegedManagesOnionResolver = manageOnionResolver;
         _macPrivilegedLogOffset = 0;
 
         try
@@ -476,6 +484,7 @@ internal sealed class VpnService : IDisposable
                     _macPrivilegedCorePidPath,
                     _macPrivilegedExitCodePath,
                     _macPrivilegedCoreMode,
+                    _macPrivilegedManagesOnionResolver,
                     _macPrivilegedTunInterface),
                 requireAdministrator: true,
                 timeoutMs: 60_000);
@@ -689,6 +698,7 @@ internal sealed class VpnService : IDisposable
         _macPrivilegedExitCodePath = null;
         _macPrivilegedCoreMode = null;
         _macPrivilegedTunInterface = null;
+        _macPrivilegedManagesOnionResolver = false;
         _macPrivilegedLogOffset = 0;
     }
 
@@ -724,10 +734,19 @@ internal sealed class VpnService : IDisposable
         string supervisorPidPath,
         string corePidPath,
         string exitCodePath,
+        bool manageOnionResolver,
+        string? onionDnsNameServer,
         string tunInterface,
         int startupDelayMs)
     {
         var startupSeconds = Math.Max(1, startupDelayMs / 1000);
+        var onionResolverSetup = manageOnionResolver
+            ? $$"""
+                mkdir -p /etc/resolver
+                printf 'nameserver %s\nport 53\n' {{MacAuthorization.QuoteShellArgument(string.IsNullOrWhiteSpace(onionDnsNameServer) ? "127.0.0.1" : onionDnsNameServer.Trim())}} > /etc/resolver/onion
+                chmod 644 /etc/resolver/onion
+                """
+            : string.Empty;
         var xrayRouteSetup = string.IsNullOrWhiteSpace(tunInterface)
             ? string.Empty
             : $$"""
@@ -742,6 +761,7 @@ internal sealed class VpnService : IDisposable
             rm -f {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}} {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
             : > {{MacAuthorization.QuoteShellArgument(logPath)}}
             chmod 644 {{MacAuthorization.QuoteShellArgument(logPath)}}
+            {{onionResolverSetup}}
             nohup /bin/sh {{MacAuthorization.QuoteShellArgument(runnerScriptPath)}} >/dev/null 2>&1 &
             SUPERVISOR_PID=$!
             printf '%s\n' "$SUPERVISOR_PID" > {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
@@ -757,6 +777,7 @@ internal sealed class VpnService : IDisposable
         string? corePidPath,
         string? exitCodePath,
         string? coreMode,
+        bool manageOnionResolver,
         string? tunInterface)
     {
         var deleteRoutes = string.Equals(coreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal) &&
@@ -766,11 +787,15 @@ internal sealed class VpnService : IDisposable
                 /sbin/route delete -net 128.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
                 """
             : string.Empty;
+        var removeOnionResolver = manageOnionResolver
+            ? "rm -f /etc/resolver/onion\n"
+            : string.Empty;
 
         return $$"""
             #!/bin/sh
             set -eu
             {{deleteRoutes}}
+            {{removeOnionResolver}}
             if [ -f {{MacAuthorization.QuoteShellArgument(corePidPath ?? string.Empty)}} ]; then
               CORE_PID=$(cat {{MacAuthorization.QuoteShellArgument(corePidPath ?? string.Empty)}} 2>/dev/null || true)
               if [ -n "$CORE_PID" ]; then
@@ -816,6 +841,8 @@ internal sealed class VpnLaunchConfig
     public bool TunStrictRoute { get; init; } = true;
     public IReadOnlyList<string> TorAppProcessNames { get; init; } = Array.Empty<string>();
     public IReadOnlyList<string> BypassAppProcessNames { get; init; } = Array.Empty<string>();
+    public bool ManageOnionResolver { get; init; }
+    public string? OnionDnsNameServer { get; init; }
     [JsonIgnore]
     public Action<Process>? ProcessStarted { get; init; }
 }
