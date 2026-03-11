@@ -29,6 +29,7 @@ public sealed class OnionHopClient : IDisposable
     private const int AutomaticBridgeProxyFailureThreshold = 8;
     private static readonly TimeSpan AutomaticBridgeProxyFailureWindow = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan AutomaticBridgeStabilityProbeDelay = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan MacAuthorizationReuseWindow = TimeSpan.FromMinutes(4);
 
     public readonly record struct StatusUpdate(
         bool IsConnecting,
@@ -97,6 +98,7 @@ public sealed class OnionHopClient : IDisposable
     private string? _activeDnsBindAddress;
     private string _activeVpnCoreMode = OnionHopConnectOptions.TunCoreSingBox;
     private bool _macNetworkExtensionActive;
+    private DateTimeOffset? _lastMacAuthorizationUtc;
 
     private CancellationTokenSource? _adminVpnMonitorCts;
     private readonly object _bridgeFailureLock = new();
@@ -403,6 +405,56 @@ public sealed class OnionHopClient : IDisposable
         {
             StartupLogger.Write($"OnionHopClient.EnsureAdminHelperAsync EXCEPTION: {ex.GetType().Name}: {ex.Message}");
             RaiseLog($"EnsureAdminHelperAsync failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    public async Task<bool> EnsureMacAdministratorAccessAsync(CancellationToken token = default)
+    {
+        if (!OperatingSystem.IsMacOS() || PlatformHelper.IsAdministrator())
+        {
+            return true;
+        }
+
+        var lastAuthorizationUtc = _lastMacAuthorizationUtc;
+        if (lastAuthorizationUtc.HasValue &&
+            DateTimeOffset.UtcNow - lastAuthorizationUtc.Value < MacAuthorizationReuseWindow)
+        {
+            RaiseLog("macOS administrator authorization was granted recently; skipping a duplicate prompt.");
+            return true;
+        }
+
+        try
+        {
+            RaiseLog("Requesting macOS administrator privileges...");
+            var result = await Task.Run(
+                () => MacAuthorization.RunScript(
+                    """
+                    #!/bin/sh
+                    set -eu
+                    /usr/bin/true
+                    """,
+                    requireAdministrator: true,
+                    timeoutMs: 180_000),
+                token).ConfigureAwait(false);
+
+            if (!result.Success)
+            {
+                RaiseLog($"macOS administrator authorization was not granted: {result.FailureMessage}");
+                return false;
+            }
+
+            _lastMacAuthorizationUtc = DateTimeOffset.UtcNow;
+            RaiseLog("macOS administrator authorization granted.");
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            RaiseLog($"EnsureMacAdministratorAccessAsync failed: {ex.Message}");
             return false;
         }
     }

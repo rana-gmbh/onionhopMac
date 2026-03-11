@@ -1186,7 +1186,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
 
                 if (SmartConnectEnabled &&
                     attemptOptions.OnionDnsProxyEnabled &&
-                    !PlatformHelper.IsAdministrator())
+                    !PlatformHelper.IsAdministrator() &&
+                    !OperatingSystem.IsWindows() &&
+                    !OperatingSystem.IsMacOS())
                 {
                     attemptOptions = attemptOptions with { OnionDnsProxyEnabled = false };
                     AppendLog("Smart Connect: disabled .onion DNS proxy for this attempt because elevated privileges are required.");
@@ -1304,21 +1306,38 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             return true;
         }
 
-        if (OperatingSystem.IsMacOS() && IsTunModeOption(options))
+        if (OperatingSystem.IsMacOS())
         {
-            if (_client.CanUseMacNetworkExtension())
+            var usesTunMode = IsTunModeOption(options);
+            var usesNetworkExtension = usesTunMode && _client.CanUseMacNetworkExtension();
+            var needsMacAdmin = options.OnionDnsProxyEnabled || (usesTunMode && !usesNetworkExtension);
+
+            if (!needsMacAdmin)
             {
-                AppendLog("Using configured macOS Network Extension profile for TUN mode (no root app launch required).");
+                if (usesNetworkExtension)
+                {
+                    AppendLog("Using configured macOS Network Extension profile for TUN mode (no admin prompt required before connect).");
+                }
+
                 return true;
             }
 
-            AppendLog("macOS will request administrator privileges only for tunnel setup; the GUI stays in the normal user session.");
-            return true;
-        }
+            var adminReason = usesTunMode && options.OnionDnsProxyEnabled
+                ? "tunnel and .onion DNS setup"
+                : usesTunMode
+                    ? "tunnel setup"
+                    : ".onion DNS setup";
 
-        if (OperatingSystem.IsMacOS())
-        {
-            AppendLog("macOS will request administrator privileges when .onion DNS needs to be configured.");
+            StatusMessage = LocalizationService.Get("Status.AdminRequiredRequesting");
+            AppendLog($"Requesting macOS administrator privileges before {adminReason}. The GUI stays in the normal user session.");
+
+            if (!await _client.EnsureMacAdministratorAccessAsync(_connectCts?.Token ?? CancellationToken.None))
+            {
+                StatusMessage = LocalizationService.Get("Status.AdminRequiredCanceled");
+                return false;
+            }
+
+            AppendLog("macOS administrator privileges granted. Proceeding with connection setup.");
             return true;
         }
 

@@ -66,6 +66,7 @@
                 ZIndex="40"
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Top"
+                Margin="96,0,0,0"
                 Height="56"
                 Background="Transparent"
                 PointerPressed="OnNativeChromePointerPressed" />

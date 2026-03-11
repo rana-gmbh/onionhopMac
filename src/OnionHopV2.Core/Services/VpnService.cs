@@ -418,22 +418,40 @@ internal sealed class VpnService : IDisposable
         _macPrivilegedTunInterface = tunInterface;
         _macPrivilegedLogOffset = 0;
 
-        StartMacPrivilegedMonitor();
-        await Task.Delay(200, token).ConfigureAwait(false);
-
-        if (TryGetMacPrivilegedExitCode(out var exitCode))
+        try
         {
-            _lastExitCode = exitCode;
-            var crashDetail = ReadMacPrivilegedLogTail();
+            var startupWait = Stopwatch.StartNew();
+            var maxStartupWaitMs = Math.Max(5000, startupDelayMs + 4000);
+
+            while (startupWait.ElapsedMilliseconds < maxStartupWaitMs)
+            {
+                token.ThrowIfCancellationRequested();
+
+                if (TryGetMacPrivilegedExitCode(out var exitCode))
+                {
+                    _lastExitCode = exitCode;
+                    var crashDetail = ReadMacPrivilegedLogTail();
+                    throw new InvalidOperationException(
+                        $"{vpnCoreLabel} exited unexpectedly during startup (exit code {exitCode}).\n{crashDetail}");
+                }
+
+                if (IsMacPrivilegedTunnelRunning())
+                {
+                    StartMacPrivilegedMonitor();
+                    return;
+                }
+
+                await Task.Delay(200, token).ConfigureAwait(false);
+            }
+
+            var timeoutDetail = ReadMacPrivilegedLogTail();
             throw new InvalidOperationException(
-                $"{vpnCoreLabel} exited unexpectedly during startup (exit code {exitCode}).\n{crashDetail}");
+                $"Unable to launch {vpnCoreLabel} through macOS authorization.\n{timeoutDetail}");
         }
-
-        if (!IsMacPrivilegedTunnelRunning())
+        catch
         {
-            var crashDetail = ReadMacPrivilegedLogTail();
-            throw new InvalidOperationException(
-                $"Unable to launch {vpnCoreLabel} through macOS authorization.\n{crashDetail}");
+            StopMacPrivilegedTunnelIfNeeded();
+            throw;
         }
     }
 
