@@ -110,8 +110,8 @@ public partial class App : Application
                 // buttons (close/minimize/fullscreen) overlay on window content.
                 // PreferSystemChrome ensures the traffic lights are shown.
                 window.ExtendClientAreaToDecorationsHint = true;
-                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.PreferSystemChrome;
-                window.ExtendClientAreaTitleBarHeightHint = 38;
+                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.PreferSystemChrome | ExtendClientAreaChromeHints.OSXThickTitleBar;
+                window.ExtendClientAreaTitleBarHeightHint = 56;
             }
             else
             {
@@ -124,6 +124,8 @@ public partial class App : Application
             {
                 sukiWindow.IsTitleBarVisible = false;
                 sukiWindow.ShowTitlebarBackground = false;
+                sukiWindow.CanFullScreen = OperatingSystem.IsMacOS();
+                sukiWindow.CanMove = true;
                 sukiWindow.CanPin = false;
             }
 

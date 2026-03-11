@@ -62,6 +62,14 @@
 
         <suki:SukiBackground Style="GradientSoft" />
 
+        <Border IsVisible="{Binding State.UseNativeMacChrome}"
+                ZIndex="40"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Top"
+                Height="56"
+                Background="Transparent"
+                PointerPressed="OnNativeChromePointerPressed" />
+
          <suki:SukiSideMenu x:Name="SideMenu"
                             IsSearchEnabled="False"
                             SidebarToggleEnabled="False"

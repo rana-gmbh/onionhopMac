@@ -24,7 +24,20 @@ internal sealed class MacKillSwitchService : IKillSwitchService
 
         if (!PlatformHelper.IsAdministrator())
         {
-            log("Kill switch on macOS requires root privileges.");
+            var result = MacAuthorization.RunScript($$"""
+                #!/bin/sh
+                set -eu
+                /sbin/pfctl -E >/dev/null 2>&1 || true
+                printf 'block drop out quick all\npass out quick on lo0 all\n' | /sbin/pfctl -a {{MacAuthorization.QuoteShellArgument(AnchorName)}} -f -
+                """, requireAdministrator: true);
+            if (result.Success)
+            {
+                log("Kill switch engaged on macOS (pf anchor rules loaded).");
+            }
+            else
+            {
+                log($"Kill switch enable failed: {result.FailureMessage}");
+            }
             return;
         }
 
@@ -58,6 +71,19 @@ internal sealed class MacKillSwitchService : IKillSwitchService
 
         if (!PlatformHelper.IsAdministrator())
         {
+            var result = MacAuthorization.RunScript($$"""
+                #!/bin/sh
+                set -eu
+                /sbin/pfctl -a {{MacAuthorization.QuoteShellArgument(AnchorName)}} -F all
+                """, requireAdministrator: true);
+            if (result.Success)
+            {
+                log("Kill switch cleared on macOS.");
+            }
+            else
+            {
+                log($"Kill switch disable failed: {result.FailureMessage}");
+            }
             return;
         }
 

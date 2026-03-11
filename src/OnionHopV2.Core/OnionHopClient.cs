@@ -114,7 +114,7 @@ public sealed class OnionHopClient : IDisposable
         _torService.OutputReceived += OnTorDataReceived;
         _torService.Exited += OnTorExited;
 
-        _vpnService.OutputReceived += OnSingBoxDataReceived;
+        _vpnService.OutputLineReceived += OnVpnOutputLine;
         _vpnService.Exited += OnSingBoxExited;
 
         _singBoxLogProcessor.SetSourceLabel(_activeVpnCoreMode);
@@ -556,11 +556,7 @@ public sealed class OnionHopClient : IDisposable
 
             if (resolvedOptions.OnionDnsProxyEnabled)
             {
-                if (!PlatformHelper.IsAdministrator())
-                {
-                    RaiseLog(".onion DNS proxying requires elevated privileges on this platform; skipping.");
-                }
-                else if (_activeDnsPort == DefaultDnsPort && !string.IsNullOrWhiteSpace(_activeDnsBindAddress))
+                if (_activeDnsPort == DefaultDnsPort && !string.IsNullOrWhiteSpace(_activeDnsBindAddress))
                 {
                     _onionDnsProxyService.Enable(_activeDnsBindAddress!, RaiseLog);
                 }
@@ -1149,6 +1145,10 @@ public sealed class OnionHopClient : IDisposable
                 {
                     _killSwitchService.DisableEmergencyBlock(RaiseLog);
                 }
+                else if (OperatingSystem.IsMacOS())
+                {
+                    _killSwitchService.DisableEmergencyBlock(RaiseLog);
+                }
                 else if (OperatingSystem.IsWindows())
                 {
                     _ = Task.Run(async () => await _adminHelper.DisableKillSwitchIfAvailableAsync().ConfigureAwait(false));
@@ -1666,11 +1666,10 @@ public sealed class OnionHopClient : IDisposable
                 return;
             }
 
-            throw new InvalidOperationException(
-                "TUN/VPN mode on macOS requires root privileges or a configured Network Extension profile.");
+            RaiseLog("StartSingBoxVpnAsync: macOS will request administrator privileges for tunnel setup.");
         }
 
-        if (!isAdmin)
+        if (!isAdmin && !OperatingSystem.IsMacOS())
         {
             throw new InvalidOperationException("TUN/VPN mode requires elevated privileges (run as Administrator/root).");
         }
@@ -1889,9 +1888,9 @@ public sealed class OnionHopClient : IDisposable
         }
     }
 
-    private void OnSingBoxDataReceived(object sender, DataReceivedEventArgs e)
+    private void OnVpnOutputLine(string line)
     {
-        ProcessSingBoxLogLine(e.Data);
+        ProcessSingBoxLogLine(line);
     }
 
     private void ProcessSingBoxLogLine(string? data)
@@ -1936,6 +1935,10 @@ public sealed class OnionHopClient : IDisposable
                         RaiseLog("Kill switch could not be enabled (admin helper unavailable).");
                     }
                 });
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                _killSwitchService.EnableEmergencyBlock(RaiseLog);
             }
             else
             {

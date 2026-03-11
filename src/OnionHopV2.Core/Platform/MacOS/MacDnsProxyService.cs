@@ -29,8 +29,22 @@ internal sealed class MacDnsProxyService : IDnsProxyService
 
         if (!PlatformHelper.IsAdministrator())
         {
-            log(".onion DNS proxying on macOS requires running OnionHop as root (or using the Swift helper with sudo).");
-            return false;
+            var result = MacAuthorization.RunScript($$"""
+                #!/bin/sh
+                set -eu
+                mkdir -p /etc/resolver
+                printf 'nameserver %s\nport 53\n' {{MacAuthorization.QuoteShellArgument(safeNameServer)}} > {{MacAuthorization.QuoteShellArgument(ResolverFilePath)}}
+                chmod 644 {{MacAuthorization.QuoteShellArgument(ResolverFilePath)}}
+                """, requireAdministrator: true);
+            if (!result.Success)
+            {
+                log($".onion DNS proxying enable failed: {result.FailureMessage}");
+                return false;
+            }
+
+            _enabled = true;
+            log($".onion DNS proxying enabled on macOS via {ResolverFilePath} (nameserver={safeNameServer}).");
+            return true;
         }
 
         try
@@ -64,6 +78,20 @@ internal sealed class MacDnsProxyService : IDnsProxyService
 
         if (!PlatformHelper.IsAdministrator())
         {
+            var result = MacAuthorization.RunScript($$"""
+                #!/bin/sh
+                set -eu
+                rm -f {{MacAuthorization.QuoteShellArgument(ResolverFilePath)}}
+                """, requireAdministrator: true);
+            if (result.Success)
+            {
+                _enabled = false;
+                log(".onion DNS proxying disabled on macOS.");
+            }
+            else
+            {
+                log($".onion DNS proxying cleanup failed: {result.FailureMessage}");
+            }
             return;
         }
 

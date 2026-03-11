@@ -448,9 +448,10 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     public string VpnLogTabHeader => string.Equals(TunCoreMode, TunCoreXray, StringComparison.OrdinalIgnoreCase)
         ? "xray"
         : "sing-box";
-    public bool CanUseOnionDnsProxy => PlatformHelper.IsAdministrator();
+    public bool CanUseOnionDnsProxy => OperatingSystem.IsMacOS() || PlatformHelper.IsAdministrator();
     public string ManualExitFingerprintSummary => BuildFingerprintSummary(ExitNodeFingerprint);
     public bool UseCustomChrome => !UseNativeTheme;
+    public bool UseNativeMacChrome => IsMacOS && UseNativeTheme;
     public bool SupportsNativeWindowChrome => true;
     public bool CanConfigureSplitTunneling => IsTunMode && UseHybridRouting;
     public string BridgeDbLastUpdateText
@@ -969,6 +970,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     partial void OnUseNativeThemeChanged(bool value)
     {
         OnPropertyChanged(nameof(UseCustomChrome));
+        OnPropertyChanged(nameof(UseNativeMacChrome));
     }
 
     partial void OnAutoStartModeChanged(string value)
@@ -1310,82 +1312,18 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                 return true;
             }
 
-            // Relaunch the app as root using osascript (shows native macOS password dialog).
-            StatusMessage = "Requesting administrator privileges…";
-            AppendLog("TUN mode requires root. Relaunching with administrator privileges via macOS authorization dialog…");
-            var elevationResult = TryRelaunchAsRoot(_client.BaseDirectory);
-            if (elevationResult)
-            {
-                // The new root instance will start after we quit.
-                // Shut down the current (non-root) instance cleanly via Avalonia.
-                AppendLog("Elevation succeeded. Shutting down non-root instance…");
-                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                {
-                    if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop)
-                    {
-                        desktop.Shutdown(0);
-                    }
-                    else
-                    {
-                        Environment.Exit(0);
-                    }
-                });
-                return false;
-            }
+            AppendLog("macOS will request administrator privileges only for tunnel setup; the GUI stays in the normal user session.");
+            return true;
+        }
 
-            StatusMessage = "Administrator privileges were not granted. TUN mode requires root.";
-            return false;
+        if (OperatingSystem.IsMacOS())
+        {
+            AppendLog("macOS will request administrator privileges when .onion DNS needs to be configured.");
+            return true;
         }
 
         StatusMessage = "This mode requires root privileges on this platform. Please relaunch OnionHop with elevated permissions.";
         return false;
-    }
-
-    private static bool TryRelaunchAsRoot(string currentBaseDirectory)
-    {
-        try
-        {
-            var exePath = Environment.ProcessPath;
-            if (string.IsNullOrWhiteSpace(exePath))
-            {
-                return false;
-            }
-
-            // Use osascript to run the app binary as root via the native macOS authorization dialog.
-            var escapedPath = exePath.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            var baseDir = currentBaseDirectory.Replace("\\", "\\\\").Replace("\"", "\\\"");
-            var script = $"do shell script \"\\\"{escapedPath}\\\" --basedir \\\"{baseDir}\\\" > /tmp/onionhop-root.log 2>&1 & echo $!\" with administrator privileges";
-
-            var psi = new System.Diagnostics.ProcessStartInfo("osascript")
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-            psi.ArgumentList.Add("-e");
-            psi.ArgumentList.Add(script);
-
-            var proc = System.Diagnostics.Process.Start(psi);
-            if (proc == null)
-            {
-                return false;
-            }
-
-            // Read stdout/stderr asynchronously to avoid deadlock with WaitForExit.
-            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
-            var stderrTask = proc.StandardError.ReadToEndAsync();
-            proc.WaitForExit(120_000);
-            var stdout = stdoutTask.GetAwaiter().GetResult().Trim();
-            var stderr = stderrTask.GetAwaiter().GetResult().Trim();
-            OnionHopV2.Core.Services.StartupLogger.Write($"osascript exit={proc.ExitCode}, stdout='{stdout}', stderr='{stderr}'");
-            return proc.ExitCode == 0;
-        }
-        catch (Exception ex)
-        {
-            OnionHopV2.Core.Services.StartupLogger.Write($"TryRelaunchAsRoot exception: {ex.Message}");
-            return false;
-        }
     }
 
     [RelayCommand]

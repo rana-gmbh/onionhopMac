@@ -36,7 +36,7 @@
                                        TextWrapping="Wrap" />
 
                             <TextBlock IsVisible="{Binding State.ShowMacOnlySettings}"
-                                       Text="macOS: run OnionHop with elevated privileges for TUN and .onion DNS, or install the Swift helper binary."
+                                       Text="macOS: OnionHop now requests administrator permission only when TUN, kill switch, or .onion DNS setup needs it."
                                        Opacity="0.65"
                                        TextWrapping="Wrap" />
 

@@ -55,6 +55,19 @@ public partial class MainWindow : SukiWindow
         }
     }
 
+    private void OnNativeChromePointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (!OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
+        if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        {
+            BeginMoveDrag(e);
+        }
+    }
+
     private void OnWindowPointerPressed(object? sender, PointerPressedEventArgs e)
     {
         if (DataContext is not ShellViewModel { State.UseCustomChrome: true })
