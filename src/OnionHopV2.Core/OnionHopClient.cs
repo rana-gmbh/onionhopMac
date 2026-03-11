@@ -551,23 +551,6 @@ public sealed class OnionHopClient : IDisposable
         {
             RaiseLog($"Connecting. Mode={options.SelectedConnectionMode}, Hybrid={options.UseHybridRouting}, Exit={options.SelectedLocation}, Bridges={(options.UseTorBridges ? options.SelectedBridgeType : "off")}");
 
-            var startedMacTunEarly = false;
-            if (ShouldStartMacPrivilegedTunEarly(options))
-            {
-                _connectionProgress = 0.2;
-                _statusMessage = options.UseHybridRouting
-                    ? "Requesting administrator access and starting Hybrid tunnel..."
-                    : "Requesting administrator access and starting VPN tunnel...";
-                PublishStatus();
-
-                await StartSingBoxVpnAsync(options, timeoutCts.Token, waitForTorSocks: false).ConfigureAwait(false);
-                startedMacTunEarly = true;
-
-                _connectionProgress = 0.3;
-                _statusMessage = "Tunnel initialized. Starting Tor and bootstrapping network...";
-                PublishStatus();
-            }
-
             var resolvedOptions = await StartTorWithBridgeFallbackAsync(options, timeoutCts.Token).ConfigureAwait(false);
             _activeOptions = resolvedOptions;
 
@@ -591,10 +574,7 @@ public sealed class OnionHopClient : IDisposable
                     : "Tor is running. Starting VPN tunnel (all traffic via Tor)...";
                 PublishStatus();
 
-                if (!startedMacTunEarly)
-                {
-                    await StartSingBoxVpnAsync(resolvedOptions, timeoutCts.Token).ConfigureAwait(false);
-                }
+                await StartSingBoxVpnAsync(resolvedOptions, timeoutCts.Token).ConfigureAwait(false);
             }
 
             if (_activeHttpPort.HasValue)
@@ -1582,7 +1562,7 @@ public sealed class OnionHopClient : IDisposable
         }
     }
 
-    private async Task StartSingBoxVpnAsync(OnionHopConnectOptions options, CancellationToken token, bool waitForTorSocks = true)
+    private async Task StartSingBoxVpnAsync(OnionHopConnectOptions options, CancellationToken token)
     {
         StartupLogger.Write($"StartSingBoxVpnAsync: VPN mode, isAdmin={PlatformHelper.IsAdministrator()}");
         RaiseLog("StartSingBoxVpnAsync: Starting VPN setup...");
@@ -1636,8 +1616,7 @@ public sealed class OnionHopClient : IDisposable
 
         // Verify Tor's SOCKS port is actually accepting connections before starting the VPN engine.
         // With bridges, Tor may report 100% bootstrap but need a moment for the SOCKS listener.
-        if (waitForTorSocks &&
-            !await WaitForSocksPortReadyAsync(_activeSocksPort, token).ConfigureAwait(false))
+        if (!await WaitForSocksPortReadyAsync(_activeSocksPort, token).ConfigureAwait(false))
         {
             RaiseLog($"Warning: Tor SOCKS port {_activeSocksPort} not responding after bootstrap. Proceeding anyway.");
         }
@@ -1709,14 +1688,6 @@ public sealed class OnionHopClient : IDisposable
         return options.OnionDnsProxyEnabled &&
                OperatingSystem.IsMacOS() &&
                IsTunMode(options) &&
-               !MacNetworkExtensionService.IsConfigured();
-    }
-
-    private static bool ShouldStartMacPrivilegedTunEarly(OnionHopConnectOptions options)
-    {
-        return OperatingSystem.IsMacOS() &&
-               IsTunMode(options) &&
-               !PlatformHelper.IsAdministrator() &&
                !MacNetworkExtensionService.IsConfigured();
     }
 
