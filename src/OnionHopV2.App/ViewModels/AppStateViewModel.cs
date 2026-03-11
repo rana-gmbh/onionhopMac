@@ -217,11 +217,12 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             ProxyScopeLocalOnly
         ];
 
-        TunCoreModes =
-        [
-            TunCoreSingBox,
-            TunCoreXray
-        ];
+        // Xray TUN is not supported on macOS: xray-core lacks process-name matching on macOS
+        // (no find_process_darwin.go), so routing rules can't distinguish tor's traffic from
+        // regular traffic, causing routing loops that kill all internet connectivity.
+        TunCoreModes = OperatingSystem.IsMacOS()
+            ? [TunCoreSingBox]
+            : [TunCoreSingBox, TunCoreXray];
 
         TunStackModes =
         [
@@ -449,8 +450,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         : "sing-box";
     public bool CanUseOnionDnsProxy => PlatformHelper.IsAdministrator();
     public string ManualExitFingerprintSummary => BuildFingerprintSummary(ExitNodeFingerprint);
-    public bool UseCustomChrome => !UseNativeTheme;
-    public bool SupportsNativeWindowChrome => true;
+    // macOS: always use custom chrome — SukiWindow doesn't properly expose native traffic light buttons.
+    public bool UseCustomChrome => OperatingSystem.IsMacOS() || !UseNativeTheme;
+    public bool SupportsNativeWindowChrome => !OperatingSystem.IsMacOS();
     public bool CanConfigureSplitTunneling => IsTunMode && UseHybridRouting;
     public string BridgeDbLastUpdateText
     {
@@ -2508,6 +2510,12 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
 
     private static string NormalizeTunCoreMode(string? mode)
     {
+        // Xray TUN is not supported on macOS (no process matching → routing loops).
+        if (OperatingSystem.IsMacOS())
+        {
+            return TunCoreSingBox;
+        }
+
         if (string.Equals(mode, TunCoreXray, StringComparison.OrdinalIgnoreCase))
         {
             return TunCoreXray;

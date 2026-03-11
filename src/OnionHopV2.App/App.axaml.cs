@@ -100,24 +100,13 @@ public partial class App : Application
     {
         var wasMaximized = window.WindowState == WindowState.Maximized;
 
-        if (useNativeChrome)
+        if (useNativeChrome && !OperatingSystem.IsMacOS())
         {
+            // Native chrome on Windows/Linux — show OS title bar and decorations.
             window.SystemDecorations = SystemDecorations.Full;
+            window.ExtendClientAreaToDecorationsHint = false;
             window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.Default;
-            window.ExtendClientAreaTitleBarHeightHint = -1; // use default OS title bar height
-
-            if (OperatingSystem.IsMacOS())
-            {
-                // On macOS, extend client area into title bar so the traffic light buttons
-                // (close/minimize/maximize) overlay on our content — standard macOS app behavior.
-                window.ExtendClientAreaToDecorationsHint = true;
-                window.ExtendClientAreaChromeHints = ExtendClientAreaChromeHints.PreferSystemChrome;
-                window.ExtendClientAreaTitleBarHeightHint = 38;
-            }
-            else
-            {
-                window.ExtendClientAreaToDecorationsHint = false;
-            }
+            window.ExtendClientAreaTitleBarHeightHint = -1;
 
             if (window is SukiWindow sukiWindow)
             {

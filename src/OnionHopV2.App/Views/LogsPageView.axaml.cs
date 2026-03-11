@@ -35,30 +35,52 @@ public partial class LogsPageView : UserControl
     {
         if (OperatingSystem.IsMacOS())
         {
-            // On macOS, Avalonia clipboard and pbcopy don't work reliably when running as root.
-            // Write text to a temp file, then use osascript "do shell script" to read it into the clipboard.
-            // osascript accesses the pasteboard through Apple Events, which works across privilege levels.
+            // When running as root on macOS, pbcopy writes to root's pasteboard, not the user's.
+            // Detect the console user and run pbcopy as them (root can su without password).
             try
             {
-                var tempFile = Path.Combine(Path.GetTempPath(), $"onionhop-clip-{Environment.ProcessId}.txt");
-                await File.WriteAllTextAsync(tempFile, text);
+                var isRoot = string.Equals(Environment.UserName, "root", StringComparison.OrdinalIgnoreCase);
+                string? consoleUser = null;
 
-                var psi = new ProcessStartInfo("/usr/bin/osascript")
+                if (isRoot)
                 {
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                psi.ArgumentList.Add("-e");
-                psi.ArgumentList.Add($"set the clipboard to (do shell script \"cat '{tempFile}'\")");
+                    var cuPsi = new ProcessStartInfo("/usr/bin/stat", "-f %Su /dev/console")
+                    {
+                        UseShellExecute = false, RedirectStandardOutput = true, CreateNoWindow = true
+                    };
+                    var cuProc = Process.Start(cuPsi);
+                    if (cuProc != null)
+                    {
+                        consoleUser = (await cuProc.StandardOutput.ReadToEndAsync()).Trim();
+                        await cuProc.WaitForExitAsync();
+                    }
+                }
+
+                ProcessStartInfo psi;
+                if (isRoot && !string.IsNullOrEmpty(consoleUser) && consoleUser != "root")
+                {
+                    // Run pbcopy as the console user so it writes to their pasteboard.
+                    psi = new ProcessStartInfo("/usr/bin/su", $"{consoleUser} -c /usr/bin/pbcopy")
+                    {
+                        RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true
+                    };
+                }
+                else
+                {
+                    psi = new ProcessStartInfo("/usr/bin/pbcopy")
+                    {
+                        RedirectStandardInput = true, UseShellExecute = false, CreateNoWindow = true
+                    };
+                }
+
                 var proc = Process.Start(psi);
                 if (proc != null)
                 {
+                    await proc.StandardInput.WriteAsync(text);
+                    proc.StandardInput.Close();
                     await proc.WaitForExitAsync();
                 }
 
-                try { File.Delete(tempFile); } catch { }
                 return;
             }
             catch
