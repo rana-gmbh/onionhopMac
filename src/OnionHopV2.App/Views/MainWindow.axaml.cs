@@ -184,14 +184,36 @@ public partial class MainWindow : SukiWindow
         _ = DwmSetWindowAttribute(handle.Handle, DWMWA_BORDER_COLOR, ref borderColor, sizeof(uint));
     }
 
+    private System.Threading.Timer? _macFullScreenWiringTimer;
+
     private void ApplyMacNativeFullScreenCapability()
     {
+        _macFullScreenWiringTimer?.Dispose();
+        _macFullScreenWiringTimer = null;
+
         if (!OperatingSystem.IsMacOS() ||
             DataContext is not ShellViewModel { State.UseNativeTheme: true })
         {
             return;
         }
 
+        // Defer the wiring so it runs AFTER SukiUI/Avalonia have finished their
+        // own window setup (which can reset the zoom button's action/target).
+        // We wire multiple times with increasing delays to ensure we win the race.
+        var attempt = 0;
+        _macFullScreenWiringTimer = new System.Threading.Timer(_ =>
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => WireMacFullScreenButton());
+            if (++attempt >= 5)
+            {
+                _macFullScreenWiringTimer?.Dispose();
+                _macFullScreenWiringTimer = null;
+            }
+        }, null, 200, 500);
+    }
+
+    private void WireMacFullScreenButton()
+    {
         var handle = TryGetPlatformHandle();
         if (handle == null || handle.Handle == IntPtr.Zero)
         {

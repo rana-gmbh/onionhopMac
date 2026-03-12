@@ -473,7 +473,22 @@ internal sealed class VpnService : IDisposable
         psi.ArgumentList.Add("-e");
         psi.ArgumentList.Add(appleScript);
 
+        var osascriptStderr = new List<string>();
         var osascriptProcess = new Process { StartInfo = psi, EnableRaisingEvents = true };
+        osascriptProcess.ErrorDataReceived += (_, args) =>
+        {
+            if (!string.IsNullOrWhiteSpace(args.Data))
+            {
+                lock (osascriptStderr) { osascriptStderr.Add(args.Data); }
+            }
+        };
+        osascriptProcess.OutputDataReceived += (_, args) =>
+        {
+            if (!string.IsNullOrWhiteSpace(args.Data))
+            {
+                _log($"[osascript] {args.Data}");
+            }
+        };
         if (!osascriptProcess.Start())
         {
             throw new InvalidOperationException("Failed to launch macOS authorization prompt.");
@@ -710,8 +725,9 @@ internal sealed class VpnService : IDisposable
                     }
 
                     // Also detect if the osascript process died unexpectedly.
-                    if (_macPrivilegedOsascriptProcess is { HasExited: true } && !TryGetMacPrivilegedExitCode(out _))
+                    if (_macPrivilegedOsascriptProcess is { HasExited: true } deadProc && !TryGetMacPrivilegedExitCode(out _))
                     {
+                        _log($"osascript process exited unexpectedly (exit code {deadProc.ExitCode}).");
                         _lastExitCode = -1;
                         Exited?.Invoke(this, EventArgs.Empty);
                         return;
@@ -985,21 +1001,20 @@ internal sealed class VpnService : IDisposable
 
         return $$"""
             #!/bin/sh
-            set -eu
+            # Do NOT use set -e: any command failure would kill the entire privileged
+            # runner before it can write the exit-code file back to the user process.
+            # Use set -u to catch typos but never set -e.
+            set -u
+            umask 022
 
             # Signal that authorization was granted and script is running.
             printf '' > {{MacAuthorization.QuoteShellArgument(startedMarkerPath)}}
-            chmod 644 {{MacAuthorization.QuoteShellArgument(startedMarkerPath)}}
-
-            # Setup: prepare session directory and log file.
             mkdir -p {{MacAuthorization.QuoteShellArgument(sessionDir)}}
             rm -f {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}} {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(exitCodePath)}} {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}}
             : > {{MacAuthorization.QuoteShellArgument(logPath)}}
-            chmod 644 {{MacAuthorization.QuoteShellArgument(logPath)}}
 
             # Record our PID as the supervisor.
             printf '%s\n' "$$" > {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
-            chmod 644 {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
 
             # Setup: configure .onion DNS resolver if needed.
             {{onionResolverSetup}}
@@ -1018,7 +1033,6 @@ internal sealed class VpnService : IDisposable
             while :; do
               if [ -f {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}} ]; then
                 printf '%s\n' 130 > {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
-                chmod 644 {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
                 exit 0
               fi
               if /usr/bin/nc -z 127.0.0.1 {{socksPort}} >/dev/null 2>&1; then
@@ -1027,7 +1041,6 @@ internal sealed class VpnService : IDisposable
               if [ "$(date +%s)" -ge "$DEADLINE" ]; then
                 printf 'Timed out waiting for Tor SOCKS port %s\n' {{socksPort}} >> {{MacAuthorization.QuoteShellArgument(logPath)}}
                 printf '%s\n' 124 > {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
-                chmod 644 {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
                 exit 0
               fi
               sleep 1
@@ -1037,12 +1050,10 @@ internal sealed class VpnService : IDisposable
             {{MacAuthorization.QuoteShellArgument(vpnCorePath)}} run -c {{MacAuthorization.QuoteShellArgument(configPath)}} >> {{MacAuthorization.QuoteShellArgument(logPath)}} 2>&1 &
             CORE_PID=$!
             printf '%s\n' "$CORE_PID" > {{MacAuthorization.QuoteShellArgument(corePidPath)}}
-            chmod 644 {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(logPath)}}
             sleep {{startupSeconds}}
             {{xrayRouteSetup}}
 
             # Monitor VPN core, checking for stop signal.
-            set +e
             while kill -0 "$CORE_PID" 2>/dev/null; do
               if [ -f {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}} ]; then
                 kill "$CORE_PID" 2>/dev/null || true
@@ -1051,11 +1062,9 @@ internal sealed class VpnService : IDisposable
               fi
               sleep 1
             done
-            wait "$CORE_PID"
+            wait "$CORE_PID" 2>/dev/null
             EXIT_CODE=$?
-            set -e
             printf '%s\n' "$EXIT_CODE" > {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
-            chmod 644 {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
             """;
     }
 
