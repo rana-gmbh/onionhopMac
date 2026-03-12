@@ -85,7 +85,7 @@ internal static class VpnConfigBuilder
             ["type"] = "tun",
             ["tag"] = "tun-in",
             ["interface_name"] = OperatingSystem.IsMacOS() ? "utun99" : "OnionHop",
-            ["address"] = new[] { "172.19.0.1/30" },
+            ["address"] = new[] { "172.19.0.1/30", "fdfe:dcba:9876::1/126" },
             ["auto_route"] = true,
             ["strict_route"] = tunStrictRoute,
             ["stack"] = resolvedTunStack
