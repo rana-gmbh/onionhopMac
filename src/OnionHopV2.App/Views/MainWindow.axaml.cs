@@ -123,6 +123,7 @@ public partial class MainWindow : SukiWindow
         }
 
         UpdateCustomChromeCornerRadius();
+        ApplyMacNativeFullScreenCapability();
     }
 
     protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
@@ -138,6 +139,7 @@ public partial class MainWindow : SukiWindow
     {
         base.OnOpened(e);
         UpdateCustomChromeCornerRadius();
+        ApplyMacNativeFullScreenCapability();
     }
 
     private void OnStatePropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -146,6 +148,7 @@ public partial class MainWindow : SukiWindow
             e.PropertyName == nameof(AppStateViewModel.UseCustomChrome))
         {
             UpdateCustomChromeCornerRadius();
+            ApplyMacNativeFullScreenCapability();
         }
     }
 
@@ -181,6 +184,53 @@ public partial class MainWindow : SukiWindow
         _ = DwmSetWindowAttribute(handle.Handle, DWMWA_BORDER_COLOR, ref borderColor, sizeof(uint));
     }
 
+    private void ApplyMacNativeFullScreenCapability()
+    {
+        if (!OperatingSystem.IsMacOS() ||
+            DataContext is not ShellViewModel { State.UseNativeTheme: true })
+        {
+            return;
+        }
+
+        var handle = TryGetPlatformHandle();
+        if (handle == null || handle.Handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var nsWindow = ResolveMacWindowHandle(handle);
+        if (nsWindow == IntPtr.Zero)
+        {
+            return;
+        }
+
+        const nuint fullScreenPrimary = 1u << 7;
+        var collectionBehaviorSelector = sel_registerName("collectionBehavior");
+        var setCollectionBehaviorSelector = sel_registerName("setCollectionBehavior:");
+        var collectionBehavior = nuint_objc_msgSend(nsWindow, collectionBehaviorSelector);
+        var updatedBehavior = collectionBehavior | fullScreenPrimary;
+        if (updatedBehavior != collectionBehavior)
+        {
+            void_objc_msgSend_nuint(nsWindow, setCollectionBehaviorSelector, updatedBehavior);
+        }
+    }
+
+    private static IntPtr ResolveMacWindowHandle(IPlatformHandle handle)
+    {
+        if (string.Equals(handle.HandleDescriptor, "NSWindow", StringComparison.OrdinalIgnoreCase))
+        {
+            return handle.Handle;
+        }
+
+        if (!string.Equals(handle.HandleDescriptor, "NSView", StringComparison.OrdinalIgnoreCase))
+        {
+            return IntPtr.Zero;
+        }
+
+        var windowSelector = sel_registerName("window");
+        return IntPtr_objc_msgSend(handle.Handle, windowSelector);
+    }
+
     private static bool IsInteractivePointerSource(object? source)
     {
         for (var visual = source as Visual; visual != null; visual = visual.GetVisualParent())
@@ -212,4 +262,16 @@ public partial class MainWindow : SukiWindow
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int dwAttribute, ref uint pvAttribute, int cbAttribute);
+
+    [DllImport("/usr/lib/libobjc.A.dylib")]
+    private static extern IntPtr sel_registerName(string name);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr IntPtr_objc_msgSend(IntPtr receiver, IntPtr selector);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern nuint nuint_objc_msgSend(IntPtr receiver, IntPtr selector);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void void_objc_msgSend_nuint(IntPtr receiver, IntPtr selector, nuint value);
 }

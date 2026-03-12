@@ -97,6 +97,7 @@ public sealed class OnionHopClient : IDisposable
     private string? _activeDnsBindAddress;
     private string _activeVpnCoreMode = OnionHopConnectOptions.TunCoreSingBox;
     private bool _macNetworkExtensionActive;
+    private VpnLaunchConfig? _preparedMacVpnLaunchConfig;
 
     private CancellationTokenSource? _adminVpnMonitorCts;
     private readonly object _bridgeFailureLock = new();
@@ -423,6 +424,8 @@ public sealed class OnionHopClient : IDisposable
             await DisconnectAsync().ConfigureAwait(false);
             return;
         }
+
+        ClearPreparedMacVpnLaunchConfig();
 
         StartupLogger.Write("OnionHopClient.ConnectAsync: Checking internet connectivity...");
         var connectivity = await InternetConnectivityProbe.CheckAsync(token).ConfigureAwait(false);
@@ -1204,6 +1207,7 @@ public sealed class OnionHopClient : IDisposable
             _activeDnsBindAddress = null;
             _activeVpnCoreMode = OnionHopConnectOptions.TunCoreSingBox;
             _macNetworkExtensionActive = false;
+            ClearPreparedMacVpnLaunchConfig();
             _singBoxLogProcessor.SetSourceLabel(_activeVpnCoreMode);
 
             if (!disableStatusUpdate)
@@ -1595,7 +1599,16 @@ public sealed class OnionHopClient : IDisposable
             RaiseLog("xray currently ignores TUN stack and strict-route tuning; using xray defaults.");
         }
 
-        var config = await BuildVpnLaunchConfigAsync(options, token).ConfigureAwait(false);
+        VpnLaunchConfig config;
+        if (ShouldPrepareMacPrivilegedTunnel(options) && _preparedMacVpnLaunchConfig != null)
+        {
+            RaiseLog("StartSingBoxVpnAsync: Reusing prepared macOS VPN launch config.");
+            config = _preparedMacVpnLaunchConfig;
+        }
+        else
+        {
+            config = await BuildVpnLaunchConfigAsync(options, token).ConfigureAwait(false);
+        }
 
         // Verify Tor's SOCKS port is actually accepting connections before starting the VPN engine.
         // With bridges, Tor may report 100% bootstrap but need a moment for the SOCKS listener.
@@ -1655,7 +1668,9 @@ public sealed class OnionHopClient : IDisposable
                 return;
             }
 
-            RaiseLog("StartSingBoxVpnAsync: macOS will request administrator privileges for tunnel setup.");
+            RaiseLog(_preparedMacVpnLaunchConfig != null
+                ? "StartSingBoxVpnAsync: Reusing prepared macOS administrator tunnel session."
+                : "StartSingBoxVpnAsync: macOS will request administrator privileges for tunnel setup.");
         }
 
         if (!isAdmin && !OperatingSystem.IsMacOS())
@@ -1675,6 +1690,12 @@ public sealed class OnionHopClient : IDisposable
 
         var config = await BuildVpnLaunchConfigAsync(options, token).ConfigureAwait(false);
         await _vpnService.PrepareMacPrivilegedTunnelAsync(config, token).ConfigureAwait(false);
+        _preparedMacVpnLaunchConfig = config;
+    }
+
+    private void ClearPreparedMacVpnLaunchConfig()
+    {
+        _preparedMacVpnLaunchConfig = null;
     }
 
     private async Task<VpnLaunchConfig> BuildVpnLaunchConfigAsync(OnionHopConnectOptions options, CancellationToken token)
