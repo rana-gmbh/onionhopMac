@@ -142,7 +142,7 @@ internal static class MacAuthorization
         }
     }
 
-    private static string EscapeAppleScriptString(string value)
+    internal static string EscapeAppleScriptString(string value)
     {
         return value
             .Replace("\\", "\\\\", StringComparison.Ordinal)

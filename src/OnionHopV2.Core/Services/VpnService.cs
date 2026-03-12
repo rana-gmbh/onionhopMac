@@ -34,8 +34,10 @@ internal sealed class VpnService : IDisposable
     private string? _macPrivilegedTunInterface;
     private bool _macPrivilegedManagesOnionResolver;
     private string? _macPrivilegedStopMarkerPath;
+    private string? _macPrivilegedStartedMarkerPath;
     private string? _macPrivilegedConfigKey;
     private long _macPrivilegedLogOffset;
+    private Process? _macPrivilegedOsascriptProcess;
 
     public VpnService(Action<string> log)
     {
@@ -410,25 +412,41 @@ internal sealed class VpnService : IDisposable
         var corePidPath = Path.Combine(sessionDir, "core.pid");
         var exitCodePath = Path.Combine(sessionDir, "exit.code");
         var stopMarkerPath = Path.Combine(sessionDir, "stop.marker");
+        var startedMarkerPath = Path.Combine(sessionDir, "started.marker");
         var runnerScriptPath = Path.Combine(sessionDir, $"{launch.VpnCoreLabel}-runner.sh");
         var tunInterface = string.Equals(launch.VpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
             ? (OperatingSystem.IsMacOS() ? "utun99" : "OnionHop")
             : string.Empty;
 
+        // Clean up old state files.
+        foreach (var f in new[] { logPath, supervisorPidPath, corePidPath, exitCodePath, stopMarkerPath, startedMarkerPath })
+        {
+            try { File.Delete(f); } catch { }
+        }
+
         File.WriteAllText(logPath, string.Empty);
+
+        // Build the combined runner script (includes setup + SOCKS wait + VPN start + monitor).
+        // This script runs SYNCHRONOUSLY inside the osascript admin context,
+        // keeping the osascript process alive for the lifetime of the VPN session.
         File.WriteAllText(
             runnerScriptPath,
             BuildMacPrivilegedRunnerScript(
+                sessionDir,
                 launch.WorkDir,
                 launch.VpnCorePath,
                 launch.ConfigPath,
                 logPath,
+                supervisorPidPath,
                 corePidPath,
                 exitCodePath,
                 stopMarkerPath,
+                startedMarkerPath,
                 config.SocksPort,
                 tunInterface,
-                launch.StartupDelayMs));
+                launch.StartupDelayMs,
+                config.ManageOnionResolver,
+                config.OnionDnsNameServer));
         if (OperatingSystem.IsMacOS())
         {
             File.SetUnixFileMode(
@@ -439,25 +457,61 @@ internal sealed class VpnService : IDisposable
         }
 
         token.ThrowIfCancellationRequested();
-        var result = MacAuthorization.RunScript(
-            BuildMacPrivilegedStartScript(
-                sessionDir,
-                runnerScriptPath,
-                logPath,
-                supervisorPidPath,
-                corePidPath,
-                exitCodePath,
-                stopMarkerPath,
-                config.ManageOnionResolver,
-                config.OnionDnsNameServer),
-            requireAdministrator: true,
-            timeoutMs: 180_000);
 
-        if (!result.Success)
+        // Launch osascript as a non-blocking Process. The runner script runs directly
+        // inside the admin context (no backgrounding with nohup), so the osascript process
+        // stays alive for the entire VPN session. This avoids the issue where backgrounded
+        // processes get killed when the Authorization Services context exits.
+        var appleScript = $"do shell script \"/bin/sh \" & quoted form of \"{MacAuthorization.EscapeAppleScriptString(runnerScriptPath)}\" with administrator privileges";
+        var psi = new ProcessStartInfo("osascript")
         {
-            throw new OperationCanceledException($"Administrator privileges were not granted. {result.FailureMessage}");
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        psi.ArgumentList.Add("-e");
+        psi.ArgumentList.Add(appleScript);
+
+        var osascriptProcess = new Process { StartInfo = psi, EnableRaisingEvents = true };
+        if (!osascriptProcess.Start())
+        {
+            throw new InvalidOperationException("Failed to launch macOS authorization prompt.");
         }
 
+        // Read output asynchronously to prevent buffer deadlocks.
+        osascriptProcess.BeginOutputReadLine();
+        osascriptProcess.BeginErrorReadLine();
+
+        // Wait for the "started" marker (confirms admin auth succeeded and script is running)
+        // or for the osascript process to exit (user canceled the password dialog).
+        var authWait = Stopwatch.StartNew();
+        while (authWait.ElapsedMilliseconds < 180_000)
+        {
+            token.ThrowIfCancellationRequested();
+
+            if (File.Exists(startedMarkerPath))
+            {
+                break;
+            }
+
+            if (osascriptProcess.HasExited)
+            {
+                osascriptProcess.Dispose();
+                throw new OperationCanceledException("Administrator privileges were not granted.");
+            }
+
+            await Task.Delay(200, token).ConfigureAwait(false);
+        }
+
+        if (!File.Exists(startedMarkerPath))
+        {
+            try { osascriptProcess.Kill(entireProcessTree: true); } catch { }
+            osascriptProcess.Dispose();
+            throw new OperationCanceledException("Timed out waiting for administrator authorization.");
+        }
+
+        _macPrivilegedOsascriptProcess = osascriptProcess;
         _macPrivilegedSessionDir = sessionDir;
         _macPrivilegedRunnerScriptPath = runnerScriptPath;
         _macPrivilegedLogPath = logPath;
@@ -468,6 +522,7 @@ internal sealed class VpnService : IDisposable
         _macPrivilegedTunInterface = tunInterface;
         _macPrivilegedManagesOnionResolver = config.ManageOnionResolver;
         _macPrivilegedStopMarkerPath = stopMarkerPath;
+        _macPrivilegedStartedMarkerPath = startedMarkerPath;
         _macPrivilegedConfigKey = launch.ConfigKey;
         _macPrivilegedLogOffset = 0;
         StartMacPrivilegedMonitor();
@@ -518,23 +573,29 @@ internal sealed class VpnService : IDisposable
             _macPrivilegedLogPath == null &&
             _macPrivilegedSupervisorPidPath == null &&
             _macPrivilegedCorePidPath == null &&
-            _macPrivilegedExitCodePath == null)
+            _macPrivilegedExitCodePath == null &&
+            _macPrivilegedOsascriptProcess == null)
         {
             return false;
         }
 
         StopMacPrivilegedMonitor();
+
+        // Signal the runner script to stop gracefully.
         SignalMacPrivilegedStop();
 
+        // Wait for the runner script to detect the stop marker and exit cleanly.
         var stopWait = Stopwatch.StartNew();
         while (stopWait.ElapsedMilliseconds < 5000)
         {
-            if (!HasMacPrivilegedSupervisorProcess() && !IsMacPrivilegedTunnelRunning())
+            if (TryGetMacPrivilegedExitCode(out _))
             {
                 break;
             }
 
-            if (TryGetMacPrivilegedExitCode(out _))
+            var osascriptDead = _macPrivilegedOsascriptProcess == null ||
+                                _macPrivilegedOsascriptProcess.HasExited;
+            if (osascriptDead && !IsMacPrivilegedTunnelRunning())
             {
                 break;
             }
@@ -542,6 +603,10 @@ internal sealed class VpnService : IDisposable
             Thread.Sleep(200);
         }
 
+        // If still running, kill the osascript process tree (which includes the runner and VPN core).
+        KillMacPrivilegedOsascriptProcess();
+
+        // If the VPN core is somehow still alive (e.g., it detached), use admin privileges to kill it.
         if (IsMacPrivilegedTunnelRunning())
         {
             var stopResult = MacAuthorization.RunScript(
@@ -566,6 +631,32 @@ internal sealed class VpnService : IDisposable
         return true;
     }
 
+    private void KillMacPrivilegedOsascriptProcess()
+    {
+        var proc = _macPrivilegedOsascriptProcess;
+        if (proc == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!proc.HasExited)
+            {
+                proc.Kill(entireProcessTree: true);
+                proc.WaitForExit(3000);
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            try { proc.Dispose(); } catch { }
+            _macPrivilegedOsascriptProcess = null;
+        }
+    }
+
     private bool CanReuseMacPrivilegedTunnel(string configKey)
     {
         if (string.IsNullOrWhiteSpace(configKey) ||
@@ -575,6 +666,12 @@ internal sealed class VpnService : IDisposable
         }
 
         if (TryGetMacPrivilegedExitCode(out _))
+        {
+            return false;
+        }
+
+        // Check that the osascript process is still alive (runner is still running).
+        if (_macPrivilegedOsascriptProcess == null || _macPrivilegedOsascriptProcess.HasExited)
         {
             return false;
         }
@@ -608,6 +705,14 @@ internal sealed class VpnService : IDisposable
                     if (TryGetMacPrivilegedExitCode(out var exitCode))
                     {
                         _lastExitCode = exitCode;
+                        Exited?.Invoke(this, EventArgs.Empty);
+                        return;
+                    }
+
+                    // Also detect if the osascript process died unexpectedly.
+                    if (_macPrivilegedOsascriptProcess is { HasExited: true } && !TryGetMacPrivilegedExitCode(out _))
+                    {
+                        _lastExitCode = -1;
                         Exited?.Invoke(this, EventArgs.Empty);
                         return;
                     }
@@ -696,6 +801,12 @@ internal sealed class VpnService : IDisposable
 
     private bool HasMacPrivilegedSupervisorProcess()
     {
+        // Check the osascript process first (it hosts the runner script).
+        if (_macPrivilegedOsascriptProcess is { HasExited: false })
+        {
+            return true;
+        }
+
         var supervisorPidPath = _macPrivilegedSupervisorPidPath;
         if (string.IsNullOrWhiteSpace(supervisorPidPath) || !File.Exists(supervisorPidPath))
         {
@@ -771,7 +882,8 @@ internal sealed class VpnService : IDisposable
                      _macPrivilegedExitCodePath,
                      _macPrivilegedLogPath,
                      _macPrivilegedRunnerScriptPath,
-                     _macPrivilegedStopMarkerPath
+                     _macPrivilegedStopMarkerPath,
+                     _macPrivilegedStartedMarkerPath
                  })
         {
             if (string.IsNullOrWhiteSpace(path))
@@ -791,6 +903,7 @@ internal sealed class VpnService : IDisposable
 
     private void ClearMacPrivilegedState()
     {
+        KillMacPrivilegedOsascriptProcess();
         _macPrivilegedSessionDir = null;
         _macPrivilegedRunnerScriptPath = null;
         _macPrivilegedLogPath = null;
@@ -801,6 +914,7 @@ internal sealed class VpnService : IDisposable
         _macPrivilegedTunInterface = null;
         _macPrivilegedManagesOnionResolver = false;
         _macPrivilegedStopMarkerPath = null;
+        _macPrivilegedStartedMarkerPath = null;
         _macPrivilegedConfigKey = null;
         _macPrivilegedLogOffset = 0;
     }
@@ -822,17 +936,27 @@ internal sealed class VpnService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Builds a self-contained runner script that includes setup tasks, SOCKS port wait,
+    /// VPN core launch, and monitoring. This script runs SYNCHRONOUSLY inside the osascript
+    /// admin context so the process stays alive for the full VPN session.
+    /// </summary>
     private static string BuildMacPrivilegedRunnerScript(
+        string sessionDir,
         string workDir,
         string vpnCorePath,
         string configPath,
         string logPath,
+        string supervisorPidPath,
         string corePidPath,
         string exitCodePath,
         string stopMarkerPath,
+        string startedMarkerPath,
         int socksPort,
         string tunInterface,
-        int startupDelayMs)
+        int startupDelayMs,
+        bool manageOnionResolver,
+        string? onionDnsNameServer)
     {
         var startupSeconds = Math.Max(1, startupDelayMs / 1000);
         const int readyTimeoutSeconds = 420;
@@ -842,11 +966,54 @@ internal sealed class VpnService : IDisposable
                 /sbin/route add -net 0.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
                 /sbin/route add -net 128.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
                 """;
+        var xrayRouteCleanup = string.IsNullOrWhiteSpace(tunInterface)
+            ? string.Empty
+            : $$"""
+                /sbin/route delete -net 0.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
+                /sbin/route delete -net 128.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
+                """;
+        var onionResolverSetup = manageOnionResolver
+            ? $$"""
+                mkdir -p /etc/resolver
+                printf 'nameserver %s\nport 53\n' {{MacAuthorization.QuoteShellArgument(string.IsNullOrWhiteSpace(onionDnsNameServer) ? "127.0.0.1" : onionDnsNameServer.Trim())}} > /etc/resolver/onion
+                chmod 644 /etc/resolver/onion
+                """
+            : string.Empty;
+        var onionResolverCleanup = manageOnionResolver
+            ? "rm -f /etc/resolver/onion"
+            : string.Empty;
 
         return $$"""
             #!/bin/sh
             set -eu
+
+            # Signal that authorization was granted and script is running.
+            printf '' > {{MacAuthorization.QuoteShellArgument(startedMarkerPath)}}
+            chmod 644 {{MacAuthorization.QuoteShellArgument(startedMarkerPath)}}
+
+            # Setup: prepare session directory and log file.
+            mkdir -p {{MacAuthorization.QuoteShellArgument(sessionDir)}}
+            rm -f {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}} {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(exitCodePath)}} {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}}
+            : > {{MacAuthorization.QuoteShellArgument(logPath)}}
+            chmod 644 {{MacAuthorization.QuoteShellArgument(logPath)}}
+
+            # Record our PID as the supervisor.
+            printf '%s\n' "$$" > {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
+            chmod 644 {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
+
+            # Setup: configure .onion DNS resolver if needed.
+            {{onionResolverSetup}}
+
+            # Cleanup handler for graceful exit.
+            cleanup() {
+              {{xrayRouteCleanup}}
+              {{onionResolverCleanup}}
+            }
+            trap cleanup EXIT
+
             cd {{MacAuthorization.QuoteShellArgument(workDir)}} || exit 1
+
+            # Wait for Tor SOCKS port to become available.
             DEADLINE=$(($(date +%s) + {{readyTimeoutSeconds}}))
             while :; do
               if [ -f {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}} ]; then
@@ -865,12 +1032,16 @@ internal sealed class VpnService : IDisposable
               fi
               sleep 1
             done
+
+            # Start VPN core.
             {{MacAuthorization.QuoteShellArgument(vpnCorePath)}} run -c {{MacAuthorization.QuoteShellArgument(configPath)}} >> {{MacAuthorization.QuoteShellArgument(logPath)}} 2>&1 &
             CORE_PID=$!
             printf '%s\n' "$CORE_PID" > {{MacAuthorization.QuoteShellArgument(corePidPath)}}
             chmod 644 {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(logPath)}}
             sleep {{startupSeconds}}
             {{xrayRouteSetup}}
+
+            # Monitor VPN core, checking for stop signal.
             set +e
             while kill -0 "$CORE_PID" 2>/dev/null; do
               if [ -f {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}} ]; then
@@ -885,41 +1056,6 @@ internal sealed class VpnService : IDisposable
             set -e
             printf '%s\n' "$EXIT_CODE" > {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
             chmod 644 {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
-            """;
-    }
-
-    private static string BuildMacPrivilegedStartScript(
-        string sessionDir,
-        string runnerScriptPath,
-        string logPath,
-        string supervisorPidPath,
-        string corePidPath,
-        string exitCodePath,
-        string stopMarkerPath,
-        bool manageOnionResolver,
-        string? onionDnsNameServer)
-    {
-        var onionResolverSetup = manageOnionResolver
-            ? $$"""
-                mkdir -p /etc/resolver
-                printf 'nameserver %s\nport 53\n' {{MacAuthorization.QuoteShellArgument(string.IsNullOrWhiteSpace(onionDnsNameServer) ? "127.0.0.1" : onionDnsNameServer.Trim())}} > /etc/resolver/onion
-                chmod 644 /etc/resolver/onion
-                """
-            : string.Empty;
-
-        return $$"""
-            #!/bin/sh
-            set -eu
-            mkdir -p {{MacAuthorization.QuoteShellArgument(sessionDir)}}
-            rm -f {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}} {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(exitCodePath)}} {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}}
-            : > {{MacAuthorization.QuoteShellArgument(logPath)}}
-            chmod 644 {{MacAuthorization.QuoteShellArgument(logPath)}}
-            {{onionResolverSetup}}
-            nohup /bin/sh {{MacAuthorization.QuoteShellArgument(runnerScriptPath)}} >/dev/null 2>&1 &
-            SUPERVISOR_PID=$!
-            printf '%s\n' "$SUPERVISOR_PID" > {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
-            chmod 644 {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
-            printf 'vpn supervisor started pid=%s\n' "$SUPERVISOR_PID"
             """;
     }
 

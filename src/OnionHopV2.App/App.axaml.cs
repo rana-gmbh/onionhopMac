@@ -122,7 +122,7 @@ public partial class App : Application
                 sukiWindow.IsTitleBarVisible = false;
                 sukiWindow.ShowTitlebarBackground = false;
                 sukiWindow.TitleBarVisibilityOnFullScreen = SukiWindow.TitleBarVisibilityMode.Unchanged;
-                sukiWindow.CanFullScreen = false;
+                sukiWindow.CanFullScreen = OperatingSystem.IsMacOS();
                 sukiWindow.CanMove = true;
                 sukiWindow.CanPin = false;
             }
