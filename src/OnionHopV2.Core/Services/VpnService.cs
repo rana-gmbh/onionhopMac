@@ -1021,6 +1021,7 @@ internal sealed class VpnService : IDisposable
 
             # Cleanup handler for graceful exit.
             cleanup() {
+              :
               {{xrayRouteCleanup}}
               {{onionResolverCleanup}}
             }
@@ -1065,6 +1066,10 @@ internal sealed class VpnService : IDisposable
             wait "$CORE_PID" 2>/dev/null
             EXIT_CODE=$?
             printf '%s\n' "$EXIT_CODE" > {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
+            # Always exit 0 — the real exit code is communicated via the exit code file.
+            # If we exit non-zero, AppleScript's "do shell script" throws an error and
+            # osascript dies with code 1, losing the actual exit code.
+            exit 0
             """;
     }
 
