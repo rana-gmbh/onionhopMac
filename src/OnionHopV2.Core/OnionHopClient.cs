@@ -551,6 +551,21 @@ public sealed class OnionHopClient : IDisposable
         {
             RaiseLog($"Connecting. Mode={options.SelectedConnectionMode}, Hybrid={options.UseHybridRouting}, Exit={options.SelectedLocation}, Bridges={(options.UseTorBridges ? options.SelectedBridgeType : "off")}");
 
+            if (ShouldPrepareMacPrivilegedTunnel(options))
+            {
+                _statusMessage = options.UseHybridRouting
+                    ? "Requesting administrator access for Hybrid tunnel..."
+                    : "Requesting administrator access for VPN tunnel...";
+                _connectionProgress = Math.Max(_connectionProgress, 0.15);
+                PublishStatus();
+
+                await PrepareMacPrivilegedTunnelAsync(options, timeoutCts.Token).ConfigureAwait(false);
+
+                _statusMessage = "Administrator access granted. Starting Tor and bootstrapping network...";
+                _connectionProgress = Math.Max(_connectionProgress, 0.18);
+                PublishStatus();
+            }
+
             var resolvedOptions = await StartTorWithBridgeFallbackAsync(options, timeoutCts.Token).ConfigureAwait(false);
             _activeOptions = resolvedOptions;
 
@@ -1566,7 +1581,10 @@ public sealed class OnionHopClient : IDisposable
     {
         StartupLogger.Write($"StartSingBoxVpnAsync: VPN mode, isAdmin={PlatformHelper.IsAdministrator()}");
         RaiseLog("StartSingBoxVpnAsync: Starting VPN setup...");
-        StopSingBoxProcess();
+        if (!ShouldPrepareMacPrivilegedTunnel(options))
+        {
+            StopSingBoxProcess();
+        }
 
         var tunCoreMode = NormalizeTunCoreMode(options.TunCoreMode);
         _activeVpnCoreMode = tunCoreMode;
@@ -1577,42 +1595,7 @@ public sealed class OnionHopClient : IDisposable
             RaiseLog("xray currently ignores TUN stack and strict-route tuning; using xray defaults.");
         }
 
-        var vpnDir = Path.Combine(_baseDir, "vpn");
-        var singBoxPath = Path.Combine(vpnDir, PlatformHelper.SingBoxBinaryName);
-        var xrayPath = Path.Combine(vpnDir, PlatformHelper.XrayBinaryName);
-        var wintunPath = PlatformHelper.NeedsWintun
-            ? Path.Combine(vpnDir, PlatformHelper.WintunLibraryName)
-            : null;
-        var doh = DohSettingsResolver.Resolve(options);
-        if (options.UseCensoredMode &&
-            string.Equals(options.SelectedDnsProvider, OnionHopConnectOptions.DnsProviderAuto, StringComparison.Ordinal))
-        {
-            var dohResolution = await DohSettingsResolver.ResolveWithHealthFallbackAsync(options, RaiseLog, token).ConfigureAwait(false);
-            doh = dohResolution.Settings;
-        }
-
-        var config = new VpnLaunchConfig
-        {
-            SingBoxPath = singBoxPath,
-            XrayPath = xrayPath,
-            WintunPath = wintunPath,
-            VpnCoreMode = tunCoreMode,
-            HybridRouting = options.UseHybridRouting,
-            SecureDns = options.UseCensoredMode,
-            SocksPort = _activeSocksPort,
-            DohServer = doh.Server,
-            DohServerPort = doh.Port,
-            DohPath = doh.Path,
-            TorAppProcessNames = ResolveHybridTorApps(options),
-            BypassAppProcessNames = ParseProcessNames(options.HybridBypassApps),
-            RouteAllWebTrafficThroughTor = options.HybridRouteAllWebTraffic,
-            BlockQuicForTorApps = options.HybridBlockQuicForTorApps,
-            TunStack = NormalizeTunStackModeForSingBox(options.TunStackMode),
-            TunMtu = options.TunMtu,
-            TunStrictRoute = options.TunStrictRoute,
-            ManageOnionResolver = ShouldManageOnionDnsInsideMacTun(options),
-            OnionDnsNameServer = _activeDnsBindAddress
-        };
+        var config = await BuildVpnLaunchConfigAsync(options, token).ConfigureAwait(false);
 
         // Verify Tor's SOCKS port is actually accepting connections before starting the VPN engine.
         // With bridges, Tor may report 100% bootstrap but need a moment for the SOCKS listener.
@@ -1622,8 +1605,8 @@ public sealed class OnionHopClient : IDisposable
         }
 
         var selectedCorePath = string.Equals(tunCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
-            ? xrayPath
-            : singBoxPath;
+            ? config.XrayPath
+            : config.SingBoxPath;
         var isAdmin = PlatformHelper.IsAdministrator();
         RaiseLog($"StartSingBoxVpnAsync: IsAdmin={isAdmin}, Core={tunCoreMode}, CorePath={selectedCorePath}");
 
@@ -1683,11 +1666,71 @@ public sealed class OnionHopClient : IDisposable
         await _vpnService.StartAsync(config, token).ConfigureAwait(false);
     }
 
+    private async Task PrepareMacPrivilegedTunnelAsync(OnionHopConnectOptions options, CancellationToken token)
+    {
+        if (!ShouldPrepareMacPrivilegedTunnel(options))
+        {
+            return;
+        }
+
+        var config = await BuildVpnLaunchConfigAsync(options, token).ConfigureAwait(false);
+        await _vpnService.PrepareMacPrivilegedTunnelAsync(config, token).ConfigureAwait(false);
+    }
+
+    private async Task<VpnLaunchConfig> BuildVpnLaunchConfigAsync(OnionHopConnectOptions options, CancellationToken token)
+    {
+        var tunCoreMode = NormalizeTunCoreMode(options.TunCoreMode);
+        var vpnDir = Path.Combine(_baseDir, "vpn");
+        var singBoxPath = Path.Combine(vpnDir, PlatformHelper.SingBoxBinaryName);
+        var xrayPath = Path.Combine(vpnDir, PlatformHelper.XrayBinaryName);
+        var wintunPath = PlatformHelper.NeedsWintun
+            ? Path.Combine(vpnDir, PlatformHelper.WintunLibraryName)
+            : null;
+        var doh = DohSettingsResolver.Resolve(options);
+        if (options.UseCensoredMode &&
+            string.Equals(options.SelectedDnsProvider, OnionHopConnectOptions.DnsProviderAuto, StringComparison.Ordinal))
+        {
+            var dohResolution = await DohSettingsResolver.ResolveWithHealthFallbackAsync(options, RaiseLog, token).ConfigureAwait(false);
+            doh = dohResolution.Settings;
+        }
+
+        return new VpnLaunchConfig
+        {
+            SingBoxPath = singBoxPath,
+            XrayPath = xrayPath,
+            WintunPath = wintunPath,
+            VpnCoreMode = tunCoreMode,
+            HybridRouting = options.UseHybridRouting,
+            SecureDns = options.UseCensoredMode,
+            SocksPort = _activeSocksPort,
+            DohServer = doh.Server,
+            DohServerPort = doh.Port,
+            DohPath = doh.Path,
+            TorAppProcessNames = ResolveHybridTorApps(options),
+            BypassAppProcessNames = ParseProcessNames(options.HybridBypassApps),
+            RouteAllWebTrafficThroughTor = options.HybridRouteAllWebTraffic,
+            BlockQuicForTorApps = options.HybridBlockQuicForTorApps,
+            TunStack = NormalizeTunStackModeForSingBox(options.TunStackMode),
+            TunMtu = options.TunMtu,
+            TunStrictRoute = options.TunStrictRoute,
+            ManageOnionResolver = ShouldManageOnionDnsInsideMacTun(options),
+            OnionDnsNameServer = _activeDnsBindAddress
+        };
+    }
+
     private static bool ShouldManageOnionDnsInsideMacTun(OnionHopConnectOptions options)
     {
         return options.OnionDnsProxyEnabled &&
                OperatingSystem.IsMacOS() &&
                IsTunMode(options) &&
+               !MacNetworkExtensionService.IsConfigured();
+    }
+
+    private static bool ShouldPrepareMacPrivilegedTunnel(OnionHopConnectOptions options)
+    {
+        return OperatingSystem.IsMacOS() &&
+               IsTunMode(options) &&
+               !PlatformHelper.IsAdministrator() &&
                !MacNetworkExtensionService.IsConfigured();
     }
 

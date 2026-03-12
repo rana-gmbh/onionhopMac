@@ -1328,7 +1328,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                     ? "tunnel setup"
                     : ".onion DNS setup";
 
-            AppendLog($"macOS will request administrator privileges when starting {adminReason}. The GUI stays in the normal user session.");
+            AppendLog($"macOS will request administrator privileges before starting {adminReason}. The GUI stays in the normal user session.");
             return true;
         }
 

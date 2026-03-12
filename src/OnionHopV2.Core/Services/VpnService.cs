@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
@@ -31,6 +33,8 @@ internal sealed class VpnService : IDisposable
     private string? _macPrivilegedCoreMode;
     private string? _macPrivilegedTunInterface;
     private bool _macPrivilegedManagesOnionResolver;
+    private string? _macPrivilegedStopMarkerPath;
+    private string? _macPrivilegedConfigKey;
     private long _macPrivilegedLogOffset;
 
     public VpnService(Action<string> log)
@@ -67,92 +71,32 @@ internal sealed class VpnService : IDisposable
             throw new ObjectDisposedException(nameof(VpnService));
         }
 
-        Stop();
-        _lastExitCode = null;
         token.ThrowIfCancellationRequested();
-
-        var vpnCoreMode = NormalizeTunCoreMode(config.VpnCoreMode);
-        var vpnCorePath = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
-            ? config.XrayPath
-            : config.SingBoxPath;
-        var vpnCoreLabel = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
-            ? "xray"
-            : "sing-box";
-
-        if (!File.Exists(vpnCorePath))
-        {
-            throw new FileNotFoundException($"VPN component missing: vpn/{Path.GetFileName(vpnCorePath)}", vpnCorePath);
-        }
-
-        if (PlatformHelper.NeedsWintun && (string.IsNullOrWhiteSpace(config.WintunPath) || !File.Exists(config.WintunPath)))
-        {
-            throw new FileNotFoundException("VPN component missing: vpn/wintun.dll", config.WintunPath);
-        }
-
-        var workDir = Path.GetDirectoryName(vpnCorePath) ?? AppContext.BaseDirectory;
-        var configDir = Path.Combine(Path.GetTempPath(), "OnionHop", vpnCoreLabel);
-        Directory.CreateDirectory(configDir);
-        var configPath = Path.Combine(configDir, $"{vpnCoreLabel}.json");
-
-        var configJson = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
-            ? XrayConfigBuilder.BuildJson(
-                config.HybridRouting,
-                config.SecureDns,
-                config.SocksPort,
-                config.TorAppProcessNames,
-                config.BypassAppProcessNames,
-                config.RouteAllWebTrafficThroughTor,
-                config.BlockQuicForTorApps,
-                config.DohServer,
-                config.DohServerPort,
-                config.DohPath,
-                config.TunMtu)
-            : VpnConfigBuilder.BuildJson(
-                config.HybridRouting,
-                config.SecureDns,
-                config.SocksPort,
-                config.TorAppProcessNames,
-                config.BypassAppProcessNames,
-                config.RouteAllWebTrafficThroughTor,
-                config.BlockQuicForTorApps,
-                config.DohServer,
-                config.DohServerPort,
-                config.DohPath,
-                config.TunStack,
-                config.TunMtu,
-                config.TunStrictRoute);
-        await File.WriteAllTextAsync(configPath, configJson, token);
-
-        _log($"Starting {vpnCoreLabel} with config: {configPath}");
-        _log($"{vpnCoreLabel} config:\n{configJson}");
-
-        // Wait longer for xray (it's slower to initialize than sing-box, especially with bridges).
-        var startupDelay = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
-            ? 2000
-            : 750;
+        var launch = await PrepareLaunchArtifactsAsync(config, token).ConfigureAwait(false);
 
         if (OperatingSystem.IsMacOS() && !PlatformHelper.IsAdministrator())
         {
-            await StartMacPrivilegedTunnelAsync(
-                vpnCoreMode,
-                vpnCorePath,
-                vpnCoreLabel,
-                workDir,
-                configPath,
-                config.ManageOnionResolver,
-                config.OnionDnsNameServer,
-                startupDelay,
-                token).ConfigureAwait(false);
+            _lastExitCode = null;
+            if (!CanReuseMacPrivilegedTunnel(launch.ConfigKey))
+            {
+                Stop();
+                await LaunchMacPrivilegedTunnelAsync(launch, config, token).ConfigureAwait(false);
+            }
+
+            await WaitForMacPrivilegedTunnelReadyAsync(launch.VpnCoreLabel, launch.StartupDelayMs, token).ConfigureAwait(false);
             return;
         }
 
-        var psi = new ProcessStartInfo(vpnCorePath, $"run -c \"{configPath}\"")
+        Stop();
+        _lastExitCode = null;
+
+        var psi = new ProcessStartInfo(launch.VpnCorePath, $"run -c \"{launch.ConfigPath}\"")
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
-            WorkingDirectory = workDir
+            WorkingDirectory = launch.WorkDir
         };
 
         // Capture startup output for crash diagnostics.
@@ -182,7 +126,7 @@ internal sealed class VpnService : IDisposable
 
         if (!_process.Start())
         {
-            throw new InvalidOperationException($"Unable to launch {vpnCoreLabel}.");
+            throw new InvalidOperationException($"Unable to launch {launch.VpnCoreLabel}.");
         }
 
         config.ProcessStarted?.Invoke(_process);
@@ -190,7 +134,7 @@ internal sealed class VpnService : IDisposable
         _process.BeginOutputReadLine();
         _process.BeginErrorReadLine();
 
-        await Task.Delay(startupDelay, token);
+        await Task.Delay(launch.StartupDelayMs, token);
 
         // Detach startup capture.
         try
@@ -212,18 +156,38 @@ internal sealed class VpnService : IDisposable
                     : "(no output captured)";
             }
 
-            _log($"{vpnCoreLabel} crash output:\n{crashDetail}");
+            _log($"{launch.VpnCoreLabel} crash output:\n{crashDetail}");
             throw new InvalidOperationException(
-                $"{vpnCoreLabel} exited unexpectedly during startup (exit code {_process.ExitCode}).\n{crashDetail}");
+                $"{launch.VpnCoreLabel} exited unexpectedly during startup (exit code {_process.ExitCode}).\n{crashDetail}");
         }
 
         // Xray creates the TUN interface but does NOT set up system routes (unlike sing-box auto_route).
         // We must add routes manually so traffic actually flows through the tunnel.
-        if (string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal))
+        if (string.Equals(launch.VpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal))
         {
             var tunName = OperatingSystem.IsMacOS() ? "utun99" : "OnionHop";
             SetupXrayRoutes(tunName);
         }
+    }
+
+    public async Task PrepareMacPrivilegedTunnelAsync(VpnLaunchConfig config, CancellationToken token)
+    {
+        if (!OperatingSystem.IsMacOS() || PlatformHelper.IsAdministrator())
+        {
+            return;
+        }
+
+        token.ThrowIfCancellationRequested();
+        var launch = await PrepareLaunchArtifactsAsync(config, token).ConfigureAwait(false);
+        if (CanReuseMacPrivilegedTunnel(launch.ConfigKey))
+        {
+            _log("Reusing prepared macOS administrator tunnel session.");
+            return;
+        }
+
+        Stop();
+        _lastExitCode = null;
+        await LaunchMacPrivilegedTunnelAsync(launch, config, token).ConfigureAwait(false);
     }
 
     public void Stop()
@@ -361,31 +325,110 @@ internal sealed class VpnService : IDisposable
         }
     }
 
-    private async Task StartMacPrivilegedTunnelAsync(
-        string vpnCoreMode,
-        string vpnCorePath,
-        string vpnCoreLabel,
-        string workDir,
-        string configPath,
-        bool manageOnionResolver,
-        string? onionDnsNameServer,
-        int startupDelayMs,
-        CancellationToken token)
+    private async Task<VpnLaunchArtifacts> PrepareLaunchArtifactsAsync(VpnLaunchConfig config, CancellationToken token)
+    {
+        var vpnCoreMode = NormalizeTunCoreMode(config.VpnCoreMode);
+        var vpnCorePath = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
+            ? config.XrayPath
+            : config.SingBoxPath;
+        var vpnCoreLabel = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
+            ? "xray"
+            : "sing-box";
+
+        if (!File.Exists(vpnCorePath))
+        {
+            throw new FileNotFoundException($"VPN component missing: vpn/{Path.GetFileName(vpnCorePath)}", vpnCorePath);
+        }
+
+        if (PlatformHelper.NeedsWintun && (string.IsNullOrWhiteSpace(config.WintunPath) || !File.Exists(config.WintunPath)))
+        {
+            throw new FileNotFoundException("VPN component missing: vpn/wintun.dll", config.WintunPath);
+        }
+
+        var workDir = Path.GetDirectoryName(vpnCorePath) ?? AppContext.BaseDirectory;
+        var configDir = Path.Combine(Path.GetTempPath(), "OnionHop", vpnCoreLabel);
+        Directory.CreateDirectory(configDir);
+        var configPath = Path.Combine(configDir, $"{vpnCoreLabel}.json");
+
+        var configJson = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
+            ? XrayConfigBuilder.BuildJson(
+                config.HybridRouting,
+                config.SecureDns,
+                config.SocksPort,
+                config.TorAppProcessNames,
+                config.BypassAppProcessNames,
+                config.RouteAllWebTrafficThroughTor,
+                config.BlockQuicForTorApps,
+                config.DohServer,
+                config.DohServerPort,
+                config.DohPath,
+                config.TunMtu)
+            : VpnConfigBuilder.BuildJson(
+                config.HybridRouting,
+                config.SecureDns,
+                config.SocksPort,
+                config.TorAppProcessNames,
+                config.BypassAppProcessNames,
+                config.RouteAllWebTrafficThroughTor,
+                config.BlockQuicForTorApps,
+                config.DohServer,
+                config.DohServerPort,
+                config.DohPath,
+                config.TunStack,
+                config.TunMtu,
+                config.TunStrictRoute);
+        await File.WriteAllTextAsync(configPath, configJson, token).ConfigureAwait(false);
+
+        _log($"Starting {vpnCoreLabel} with config: {configPath}");
+        _log($"{vpnCoreLabel} config:\n{configJson}");
+
+        var startupDelayMs = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
+            ? 2000
+            : 750;
+        var configKey = Convert.ToHexString(
+            SHA256.HashData(
+                Encoding.UTF8.GetBytes(
+                    $"{vpnCoreMode}\n{config.ManageOnionResolver}\n{config.OnionDnsNameServer ?? string.Empty}\n{configJson}")));
+
+        return new VpnLaunchArtifacts(
+            VpnCoreMode: vpnCoreMode,
+            VpnCorePath: vpnCorePath,
+            VpnCoreLabel: vpnCoreLabel,
+            WorkDir: workDir,
+            ConfigPath: configPath,
+            StartupDelayMs: startupDelayMs,
+            ConfigKey: configKey);
+    }
+
+    private async Task LaunchMacPrivilegedTunnelAsync(VpnLaunchArtifacts launch, VpnLaunchConfig config, CancellationToken token)
     {
         var sessionDir = Path.Combine(Path.GetTempPath(), "OnionHop", "mac-vpn");
         Directory.CreateDirectory(sessionDir);
 
-        var logPath = Path.Combine(sessionDir, $"{vpnCoreLabel}.log");
+        var logPath = Path.Combine(sessionDir, $"{launch.VpnCoreLabel}.log");
         var supervisorPidPath = Path.Combine(sessionDir, "supervisor.pid");
         var corePidPath = Path.Combine(sessionDir, "core.pid");
         var exitCodePath = Path.Combine(sessionDir, "exit.code");
-        var runnerScriptPath = Path.Combine(sessionDir, $"{vpnCoreLabel}-runner.sh");
-        var tunInterface = string.Equals(vpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
+        var stopMarkerPath = Path.Combine(sessionDir, "stop.marker");
+        var runnerScriptPath = Path.Combine(sessionDir, $"{launch.VpnCoreLabel}-runner.sh");
+        var tunInterface = string.Equals(launch.VpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal)
             ? (OperatingSystem.IsMacOS() ? "utun99" : "OnionHop")
             : string.Empty;
 
         File.WriteAllText(logPath, string.Empty);
-        File.WriteAllText(runnerScriptPath, BuildMacPrivilegedRunnerScript(workDir, vpnCorePath, configPath, logPath, corePidPath, exitCodePath));
+        File.WriteAllText(
+            runnerScriptPath,
+            BuildMacPrivilegedRunnerScript(
+                launch.WorkDir,
+                launch.VpnCorePath,
+                launch.ConfigPath,
+                logPath,
+                corePidPath,
+                exitCodePath,
+                stopMarkerPath,
+                config.SocksPort,
+                tunInterface,
+                launch.StartupDelayMs));
         if (OperatingSystem.IsMacOS())
         {
             File.SetUnixFileMode(
@@ -395,6 +438,7 @@ internal sealed class VpnService : IDisposable
                 UnixFileMode.UserExecute);
         }
 
+        token.ThrowIfCancellationRequested();
         var result = MacAuthorization.RunScript(
             BuildMacPrivilegedStartScript(
                 sessionDir,
@@ -403,16 +447,15 @@ internal sealed class VpnService : IDisposable
                 supervisorPidPath,
                 corePidPath,
                 exitCodePath,
-                manageOnionResolver,
-                onionDnsNameServer,
-                tunInterface,
-                startupDelayMs),
+                stopMarkerPath,
+                config.ManageOnionResolver,
+                config.OnionDnsNameServer),
             requireAdministrator: true,
             timeoutMs: 180_000);
 
         if (!result.Success)
         {
-            throw new InvalidOperationException($"Administrator privileges are required to start the macOS tunnel. {result.FailureMessage}");
+            throw new OperationCanceledException($"Administrator privileges were not granted. {result.FailureMessage}");
         }
 
         _macPrivilegedSessionDir = sessionDir;
@@ -421,15 +464,22 @@ internal sealed class VpnService : IDisposable
         _macPrivilegedSupervisorPidPath = supervisorPidPath;
         _macPrivilegedCorePidPath = corePidPath;
         _macPrivilegedExitCodePath = exitCodePath;
-        _macPrivilegedCoreMode = vpnCoreMode;
+        _macPrivilegedCoreMode = launch.VpnCoreMode;
         _macPrivilegedTunInterface = tunInterface;
-        _macPrivilegedManagesOnionResolver = manageOnionResolver;
+        _macPrivilegedManagesOnionResolver = config.ManageOnionResolver;
+        _macPrivilegedStopMarkerPath = stopMarkerPath;
+        _macPrivilegedConfigKey = launch.ConfigKey;
         _macPrivilegedLogOffset = 0;
+        StartMacPrivilegedMonitor();
+        await Task.Delay(100, token).ConfigureAwait(false);
+    }
 
+    private async Task WaitForMacPrivilegedTunnelReadyAsync(string vpnCoreLabel, int startupDelayMs, CancellationToken token)
+    {
         try
         {
             var startupWait = Stopwatch.StartNew();
-            var maxStartupWaitMs = Math.Max(5000, startupDelayMs + 4000);
+            var maxStartupWaitMs = Math.Max(15_000, startupDelayMs + 10_000);
 
             while (startupWait.ElapsedMilliseconds < maxStartupWaitMs)
             {
@@ -445,7 +495,6 @@ internal sealed class VpnService : IDisposable
 
                 if (IsMacPrivilegedTunnelRunning())
                 {
-                    StartMacPrivilegedMonitor();
                     return;
                 }
 
@@ -475,6 +524,23 @@ internal sealed class VpnService : IDisposable
         }
 
         StopMacPrivilegedMonitor();
+        SignalMacPrivilegedStop();
+
+        var stopWait = Stopwatch.StartNew();
+        while (stopWait.ElapsedMilliseconds < 5000)
+        {
+            if (!HasMacPrivilegedSupervisorProcess() && !IsMacPrivilegedTunnelRunning())
+            {
+                break;
+            }
+
+            if (TryGetMacPrivilegedExitCode(out _))
+            {
+                break;
+            }
+
+            Thread.Sleep(200);
+        }
 
         if (IsMacPrivilegedTunnelRunning())
         {
@@ -498,6 +564,23 @@ internal sealed class VpnService : IDisposable
         CleanupMacPrivilegedStateFiles();
         ClearMacPrivilegedState();
         return true;
+    }
+
+    private bool CanReuseMacPrivilegedTunnel(string configKey)
+    {
+        if (string.IsNullOrWhiteSpace(configKey) ||
+            !string.Equals(_macPrivilegedConfigKey, configKey, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (TryGetMacPrivilegedExitCode(out _))
+        {
+            return false;
+        }
+
+        return !string.IsNullOrWhiteSpace(_macPrivilegedRunnerScriptPath) &&
+               !string.IsNullOrWhiteSpace(_macPrivilegedSupervisorPidPath);
     }
 
     private void StartMacPrivilegedMonitor()
@@ -611,6 +694,23 @@ internal sealed class VpnService : IDisposable
         return !string.IsNullOrWhiteSpace(psOutput);
     }
 
+    private bool HasMacPrivilegedSupervisorProcess()
+    {
+        var supervisorPidPath = _macPrivilegedSupervisorPidPath;
+        if (string.IsNullOrWhiteSpace(supervisorPidPath) || !File.Exists(supervisorPidPath))
+        {
+            return false;
+        }
+
+        if (!TryReadIntFromFile(supervisorPidPath, out var pid) || pid <= 0)
+        {
+            return false;
+        }
+
+        var psOutput = PlatformHelper.RunCommand("ps", $"-p {pid} -o pid=");
+        return !string.IsNullOrWhiteSpace(psOutput);
+    }
+
     private bool TryGetMacPrivilegedExitCode(out int exitCode)
     {
         var exitCodePath = _macPrivilegedExitCodePath;
@@ -670,7 +770,8 @@ internal sealed class VpnService : IDisposable
                      _macPrivilegedCorePidPath,
                      _macPrivilegedExitCodePath,
                      _macPrivilegedLogPath,
-                     _macPrivilegedRunnerScriptPath
+                     _macPrivilegedRunnerScriptPath,
+                     _macPrivilegedStopMarkerPath
                  })
         {
             if (string.IsNullOrWhiteSpace(path))
@@ -699,7 +800,26 @@ internal sealed class VpnService : IDisposable
         _macPrivilegedCoreMode = null;
         _macPrivilegedTunInterface = null;
         _macPrivilegedManagesOnionResolver = false;
+        _macPrivilegedStopMarkerPath = null;
+        _macPrivilegedConfigKey = null;
         _macPrivilegedLogOffset = 0;
+    }
+
+    private void SignalMacPrivilegedStop()
+    {
+        var stopMarkerPath = _macPrivilegedStopMarkerPath;
+        if (string.IsNullOrWhiteSpace(stopMarkerPath))
+        {
+            return;
+        }
+
+        try
+        {
+            File.WriteAllText(stopMarkerPath, "stop");
+        }
+        catch
+        {
+        }
     }
 
     private static string BuildMacPrivilegedRunnerScript(
@@ -708,17 +828,58 @@ internal sealed class VpnService : IDisposable
         string configPath,
         string logPath,
         string corePidPath,
-        string exitCodePath)
+        string exitCodePath,
+        string stopMarkerPath,
+        int socksPort,
+        string tunInterface,
+        int startupDelayMs)
     {
+        var startupSeconds = Math.Max(1, startupDelayMs / 1000);
+        const int readyTimeoutSeconds = 420;
+        var xrayRouteSetup = string.IsNullOrWhiteSpace(tunInterface)
+            ? string.Empty
+            : $$"""
+                /sbin/route add -net 0.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
+                /sbin/route add -net 128.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
+                """;
+
         return $$"""
             #!/bin/sh
             set -eu
             cd {{MacAuthorization.QuoteShellArgument(workDir)}} || exit 1
+            DEADLINE=$(($(date +%s) + {{readyTimeoutSeconds}}))
+            while :; do
+              if [ -f {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}} ]; then
+                printf '%s\n' 130 > {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
+                chmod 644 {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
+                exit 0
+              fi
+              if /usr/bin/nc -z 127.0.0.1 {{socksPort}} >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                printf 'Timed out waiting for Tor SOCKS port %s\n' {{socksPort}} >> {{MacAuthorization.QuoteShellArgument(logPath)}}
+                printf '%s\n' 124 > {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
+                chmod 644 {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
+                exit 0
+              fi
+              sleep 1
+            done
             {{MacAuthorization.QuoteShellArgument(vpnCorePath)}} run -c {{MacAuthorization.QuoteShellArgument(configPath)}} >> {{MacAuthorization.QuoteShellArgument(logPath)}} 2>&1 &
             CORE_PID=$!
             printf '%s\n' "$CORE_PID" > {{MacAuthorization.QuoteShellArgument(corePidPath)}}
             chmod 644 {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(logPath)}}
+            sleep {{startupSeconds}}
+            {{xrayRouteSetup}}
             set +e
+            while kill -0 "$CORE_PID" 2>/dev/null; do
+              if [ -f {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}} ]; then
+                kill "$CORE_PID" 2>/dev/null || true
+                sleep 1
+                kill -9 "$CORE_PID" 2>/dev/null || true
+              fi
+              sleep 1
+            done
             wait "$CORE_PID"
             EXIT_CODE=$?
             set -e
@@ -734,12 +895,10 @@ internal sealed class VpnService : IDisposable
         string supervisorPidPath,
         string corePidPath,
         string exitCodePath,
+        string stopMarkerPath,
         bool manageOnionResolver,
-        string? onionDnsNameServer,
-        string tunInterface,
-        int startupDelayMs)
+        string? onionDnsNameServer)
     {
-        var startupSeconds = Math.Max(1, startupDelayMs / 1000);
         var onionResolverSetup = manageOnionResolver
             ? $$"""
                 mkdir -p /etc/resolver
@@ -747,18 +906,12 @@ internal sealed class VpnService : IDisposable
                 chmod 644 /etc/resolver/onion
                 """
             : string.Empty;
-        var xrayRouteSetup = string.IsNullOrWhiteSpace(tunInterface)
-            ? string.Empty
-            : $$"""
-                /sbin/route add -net 0.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
-                /sbin/route add -net 128.0.0.0/1 -interface {{MacAuthorization.QuoteShellArgument(tunInterface)}} >/dev/null 2>&1 || true
-                """;
 
         return $$"""
             #!/bin/sh
             set -eu
             mkdir -p {{MacAuthorization.QuoteShellArgument(sessionDir)}}
-            rm -f {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}} {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(exitCodePath)}}
+            rm -f {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}} {{MacAuthorization.QuoteShellArgument(corePidPath)}} {{MacAuthorization.QuoteShellArgument(exitCodePath)}} {{MacAuthorization.QuoteShellArgument(stopMarkerPath)}}
             : > {{MacAuthorization.QuoteShellArgument(logPath)}}
             chmod 644 {{MacAuthorization.QuoteShellArgument(logPath)}}
             {{onionResolverSetup}}
@@ -766,9 +919,7 @@ internal sealed class VpnService : IDisposable
             SUPERVISOR_PID=$!
             printf '%s\n' "$SUPERVISOR_PID" > {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
             chmod 644 {{MacAuthorization.QuoteShellArgument(supervisorPidPath)}}
-            sleep {{startupSeconds}}
-            {{xrayRouteSetup}}
-            printf 'vpn started pid=%s\n' "$SUPERVISOR_PID"
+            printf 'vpn supervisor started pid=%s\n' "$SUPERVISOR_PID"
             """;
     }
 
@@ -813,6 +964,15 @@ internal sealed class VpnService : IDisposable
             rm -f {{MacAuthorization.QuoteShellArgument(corePidPath ?? string.Empty)}} {{MacAuthorization.QuoteShellArgument(supervisorPidPath ?? string.Empty)}} {{MacAuthorization.QuoteShellArgument(exitCodePath ?? string.Empty)}}
             """;
     }
+
+    private sealed record VpnLaunchArtifacts(
+        string VpnCoreMode,
+        string VpnCorePath,
+        string VpnCoreLabel,
+        string WorkDir,
+        string ConfigPath,
+        int StartupDelayMs,
+        string ConfigKey);
 
     private static string NormalizeTunCoreMode(string? value)
     {
