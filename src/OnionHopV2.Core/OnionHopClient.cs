@@ -554,21 +554,6 @@ public sealed class OnionHopClient : IDisposable
         {
             RaiseLog($"Connecting. Mode={options.SelectedConnectionMode}, Hybrid={options.UseHybridRouting}, Exit={options.SelectedLocation}, Bridges={(options.UseTorBridges ? options.SelectedBridgeType : "off")}");
 
-            if (ShouldPrepareMacPrivilegedTunnel(options))
-            {
-                _statusMessage = options.UseHybridRouting
-                    ? "Requesting administrator access for Hybrid tunnel..."
-                    : "Requesting administrator access for VPN tunnel...";
-                _connectionProgress = Math.Max(_connectionProgress, 0.15);
-                PublishStatus();
-
-                await PrepareMacPrivilegedTunnelAsync(options, timeoutCts.Token).ConfigureAwait(false);
-
-                _statusMessage = "Administrator access granted. Starting Tor and bootstrapping network...";
-                _connectionProgress = Math.Max(_connectionProgress, 0.18);
-                PublishStatus();
-            }
-
             var resolvedOptions = await StartTorWithBridgeFallbackAsync(options, timeoutCts.Token).ConfigureAwait(false);
             _activeOptions = resolvedOptions;
 

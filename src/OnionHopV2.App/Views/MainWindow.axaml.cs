@@ -204,6 +204,7 @@ public partial class MainWindow : SukiWindow
             return;
         }
 
+        // Enable fullscreen capability via collection behavior.
         const nuint fullScreenPrimary = 1u << 7;
         var collectionBehaviorSelector = sel_registerName("collectionBehavior");
         var setCollectionBehaviorSelector = sel_registerName("setCollectionBehavior:");
@@ -212,6 +213,17 @@ public partial class MainWindow : SukiWindow
         if (updatedBehavior != collectionBehavior)
         {
             void_objc_msgSend_nuint(nsWindow, setCollectionBehaviorSelector, updatedBehavior);
+        }
+
+        // Wire the green (zoom) button directly to toggleFullScreen:.
+        // Avalonia/SukiUI intercepts the default zoom: action, preventing the native
+        // fullscreen button from working on click. By re-targeting the button, we
+        // bypass the interception.
+        var zoomButton = IntPtr_objc_msgSend_long(nsWindow, sel_registerName("standardWindowButton:"), 2); // NSWindowZoomButton = 2
+        if (zoomButton != IntPtr.Zero)
+        {
+            void_objc_msgSend_IntPtr(zoomButton, sel_registerName("setAction:"), sel_registerName("toggleFullScreen:"));
+            void_objc_msgSend_IntPtr(zoomButton, sel_registerName("setTarget:"), nsWindow);
         }
     }
 
@@ -274,4 +286,10 @@ public partial class MainWindow : SukiWindow
 
     [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
     private static extern void void_objc_msgSend_nuint(IntPtr receiver, IntPtr selector, nuint value);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern IntPtr IntPtr_objc_msgSend_long(IntPtr receiver, IntPtr selector, long arg);
+
+    [DllImport("/usr/lib/libobjc.A.dylib", EntryPoint = "objc_msgSend")]
+    private static extern void void_objc_msgSend_IntPtr(IntPtr receiver, IntPtr selector, IntPtr arg);
 }
