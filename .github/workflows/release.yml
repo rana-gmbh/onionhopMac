@@ -81,7 +81,14 @@ jobs:
             mkdir -p "$(dirname "$outfile")"
 
             if [ -f "$arm64file" ] && file "$arm64file" | grep -q "Mach-O" && file "$x64file" | grep -q "Mach-O"; then
-              lipo -create "$arm64file" "$x64file" -output "$outfile"
+              arm64_archs="$(lipo -archs "$arm64file" 2>/dev/null || true)"
+              x64_archs="$(lipo -archs "$x64file" 2>/dev/null || true)"
+
+              if [ -n "$arm64_archs" ] && [ "$arm64_archs" != "$x64_archs" ]; then
+                lipo -create "$arm64file" "$x64file" -output "$outfile"
+              else
+                cp "$arm64file" "$outfile"
+              fi
             elif [ ! -f "$outfile" ]; then
               cp "$x64file" "$outfile"
             fi
