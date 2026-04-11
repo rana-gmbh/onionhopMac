@@ -2077,9 +2077,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             AutoUpdate = AutoUpdate,
             KillSwitchEnabled = KillSwitchEnabled,
             ThemeMode = ThemeMode,
-            IsDarkMode = string.Equals(ThemeMode, ThemeModeDark, StringComparison.OrdinalIgnoreCase) ||
-                         (string.Equals(ThemeMode, ThemeModeSystem, StringComparison.OrdinalIgnoreCase) &&
-                          Application.Current?.ActualThemeVariant == ThemeVariant.Dark),
+            IsDarkMode = IsDarkMode,
             UseNativeTheme = UseNativeTheme,
             SelectedLocation = SelectedLocation,
             SelectedEntryLocation = SelectedEntryLocation,
@@ -2166,6 +2164,18 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             ThemeModeLight => ThemeVariant.Light,
             _ => ThemeVariant.Default
         };
+
+        var resolvedIsDark = ThemeMode switch
+        {
+            ThemeModeDark => true,
+            ThemeModeLight => false,
+            _ => Application.Current.ActualThemeVariant == ThemeVariant.Dark
+        };
+
+        if (IsDarkMode != resolvedIsDark)
+        {
+            IsDarkMode = resolvedIsDark;
+        }
     }
 
     private void RefreshLanguageOptions()

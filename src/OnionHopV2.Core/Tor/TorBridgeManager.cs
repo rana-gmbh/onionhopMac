@@ -1102,11 +1102,6 @@ internal sealed class TorBridgeManager
         Action<string> log)
     {
         var ptPath = Path.Combine(torDir, "pluggable_transports");
-        // Use absolute paths so pluggable transports are found regardless of
-        // working directory (critical when relaunched as root for TUN mode).
-        var ptRelativePath = ptPath;
-        var ptRelativePathWithSlash = ptPath + Path.DirectorySeparatorChar;
-
         var needed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var line in bridgeLines)
         {
@@ -1123,14 +1118,21 @@ internal sealed class TorBridgeManager
             return Array.Empty<string>();
         }
 
-        string? webTunnelPlugin = null;
         if (needed.Contains(WebTunnelBridgeType))
         {
-            if (!TryEnsureWebTunnelClient(ptPath, log, out webTunnelPlugin))
+            if (!TryEnsureWebTunnelClient(ptPath, log))
             {
                 return Array.Empty<string>();
             }
         }
+
+        // Tor can misparse ClientTransportPlugin executable paths that contain
+        // spaces when they are supplied via command-line options. Stage the PT
+        // directory under a whitespace-safe runtime path before building the
+        // plugin lines so macOS "Application Support" installs work reliably.
+        var launchPtPath = PreparePluggableTransportLaunchDirectory(ptPath, log);
+        var ptRelativePath = launchPtPath;
+        var ptRelativePathWithSlash = launchPtPath + Path.DirectorySeparatorChar;
 
         if (config?.PluggableTransports != null && config.PluggableTransports.Count > 0)
         {
@@ -1140,7 +1142,7 @@ internal sealed class TorBridgeManager
             {
                 if (string.Equals(transport, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
                 {
-                    pluginLines.Add(webTunnelPlugin!);
+                    pluginLines.Add(BuildWebTunnelPluginLine(ptRelativePath));
                     continue;
                 }
 
@@ -1158,7 +1160,7 @@ internal sealed class TorBridgeManager
                 .ToList();
         }
 
-        return ApplySnowflakeOptions(options, BuildFallbackTransportPlugins(needed, ptRelativePath, webTunnelPlugin), ptRelativePath, log)
+        return ApplySnowflakeOptions(options, BuildFallbackTransportPlugins(needed, ptRelativePath), ptRelativePath, log)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -1324,17 +1326,14 @@ internal sealed class TorBridgeManager
             || value.EndsWith(".sh", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static IReadOnlyList<string> BuildFallbackTransportPlugins(IReadOnlyCollection<string> transports, string ptRelativePath, string? webTunnelPlugin)
+    private static IReadOnlyList<string> BuildFallbackTransportPlugins(IReadOnlyCollection<string> transports, string ptRelativePath)
     {
         var plugins = new List<string>();
         foreach (var transport in transports)
         {
             if (string.Equals(transport, WebTunnelBridgeType, StringComparison.OrdinalIgnoreCase))
             {
-                if (!string.IsNullOrWhiteSpace(webTunnelPlugin))
-                {
-                    plugins.Add(webTunnelPlugin);
-                }
+                plugins.Add(BuildWebTunnelPluginLine(ptRelativePath));
                 continue;
             }
 
@@ -1489,9 +1488,8 @@ internal sealed class TorBridgeManager
         return prefix + transport + afterPrefix.Substring(space);
     }
 
-    private bool TryEnsureWebTunnelClient(string ptPath, Action<string> log, out string? pluginLine)
+    private bool TryEnsureWebTunnelClient(string ptPath, Action<string> log)
     {
-        pluginLine = null;
         BridgeValidationMessage = null;
 
         var clientPath = Path.Combine(ptPath, WebTunnelClientFileName);
@@ -1519,8 +1517,121 @@ internal sealed class TorBridgeManager
             return false;
         }
 
-        pluginLine = $"ClientTransportPlugin webtunnel exec {Path.Combine(ptPath, WebTunnelClientFileName)}";
         return true;
+    }
+
+    private static string BuildWebTunnelPluginLine(string ptPath)
+    {
+        return $"ClientTransportPlugin webtunnel exec {Path.Combine(ptPath, WebTunnelClientFileName)}";
+    }
+
+    private static string PreparePluggableTransportLaunchDirectory(string sourcePtPath, Action<string> log)
+    {
+        if (!PathContainsWhitespace(sourcePtPath))
+        {
+            return sourcePtPath;
+        }
+
+        var runtimePtPath = GetWhitespaceSafeRuntimePtPath();
+        if (PathContainsWhitespace(runtimePtPath))
+        {
+            log($"Pluggable transport staging skipped because runtime path still contains spaces: {runtimePtPath}");
+            return sourcePtPath;
+        }
+
+        try
+        {
+            MirrorDirectoryContents(sourcePtPath, runtimePtPath);
+            log($"Staged pluggable transports under {runtimePtPath} to avoid Tor path parsing issues.");
+            return runtimePtPath;
+        }
+        catch (Exception ex)
+        {
+            log($"Pluggable transport staging failed ({ex.Message}). Falling back to {sourcePtPath}.");
+            return sourcePtPath;
+        }
+    }
+
+    private static string GetWhitespaceSafeRuntimePtPath()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return Path.Combine("/tmp", "OnionHop", "pluggable_transports");
+        }
+
+        var tempCandidate = Path.Combine(Path.GetTempPath(), "OnionHop", "pluggable_transports");
+        if (!PathContainsWhitespace(tempCandidate))
+        {
+            return tempCandidate;
+        }
+
+        var systemDrive = Environment.GetEnvironmentVariable("SystemDrive");
+        if (!string.IsNullOrWhiteSpace(systemDrive))
+        {
+            return Path.Combine(systemDrive + Path.DirectorySeparatorChar, "OnionHopRuntime", "pluggable_transports");
+        }
+
+        return tempCandidate;
+    }
+
+    private static void MirrorDirectoryContents(string sourceDir, string destinationDir)
+    {
+        Directory.CreateDirectory(destinationDir);
+
+        foreach (var destinationSubdirectory in Directory.GetDirectories(destinationDir))
+        {
+            var name = Path.GetFileName(destinationSubdirectory);
+            var sourceSubdirectory = Path.Combine(sourceDir, name);
+            if (!Directory.Exists(sourceSubdirectory))
+            {
+                Directory.Delete(destinationSubdirectory, recursive: true);
+            }
+        }
+
+        foreach (var destinationFile in Directory.GetFiles(destinationDir))
+        {
+            var name = Path.GetFileName(destinationFile);
+            var sourceFile = Path.Combine(sourceDir, name);
+            if (!File.Exists(sourceFile))
+            {
+                File.Delete(destinationFile);
+            }
+        }
+
+        foreach (var sourceSubdirectory in Directory.GetDirectories(sourceDir))
+        {
+            var name = Path.GetFileName(sourceSubdirectory);
+            MirrorDirectoryContents(sourceSubdirectory, Path.Combine(destinationDir, name));
+        }
+
+        foreach (var sourceFile in Directory.GetFiles(sourceDir))
+        {
+            var destinationFile = Path.Combine(destinationDir, Path.GetFileName(sourceFile));
+            File.Copy(sourceFile, destinationFile, overwrite: true);
+            CopyUnixFileModeIfAvailable(sourceFile, destinationFile);
+        }
+    }
+
+    private static void CopyUnixFileModeIfAvailable(string sourcePath, string destinationPath)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        try
+        {
+            var mode = File.GetUnixFileMode(sourcePath);
+            File.SetUnixFileMode(destinationPath, mode);
+        }
+        catch
+        {
+        }
+    }
+
+    private static bool PathContainsWhitespace(string path)
+    {
+        return !string.IsNullOrWhiteSpace(path) && path.Any(char.IsWhiteSpace);
     }
 
     private static string? FindWebTunnelClientInTorBrowser()
