@@ -324,6 +324,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private bool _isConnecting;
     [ObservableProperty] private bool _isConnected;
     [ObservableProperty] private bool _isDisconnecting;
+    [ObservableProperty] private bool _isPreparingConnection;
 
     [ObservableProperty] private string _selectedLocation = AutomaticLocationLabel;
     [ObservableProperty] private string _selectedEntryLocation = AutomaticLocationLabel;
@@ -423,12 +424,12 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     private DateTime _lastSpeedSampleUtc;
     private bool _speedUpdateInProgress;
 
-    public bool IsBusy => IsConnecting || IsDisconnecting || IsDependencyDownloadInProgress;
+    public bool IsBusy => IsPreparingConnection || IsConnecting || IsDisconnecting || IsDependencyDownloadInProgress;
 
-    public bool ShowConnectButton => !IsConnected && !IsConnecting;
-    public bool ShowDisconnectButton => IsConnected && !IsConnecting && !IsDisconnecting;
-    public bool ShowCancelButton => IsConnecting;
-    public bool CanUpdateBridgeDb => IsConnected && !IsConnecting && !IsDisconnecting && !IsBridgeDbUpdateInProgress;
+    public bool ShowConnectButton => !IsConnected && !IsPreparingConnection && !IsConnecting;
+    public bool ShowDisconnectButton => IsConnected && !IsPreparingConnection && !IsConnecting && !IsDisconnecting;
+    public bool ShowCancelButton => IsPreparingConnection || IsConnecting;
+    public bool CanUpdateBridgeDb => IsConnected && !IsPreparingConnection && !IsConnecting && !IsDisconnecting && !IsBridgeDbUpdateInProgress;
 
     public bool IsTunMode => string.Equals(SelectedConnectionMode, ConnectionModeTun, StringComparison.Ordinal);
     public bool IsProxyMode => !IsTunMode;
@@ -770,6 +771,15 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     }
 
     partial void OnIsConnectingChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsBusy));
+        OnPropertyChanged(nameof(ShowConnectButton));
+        OnPropertyChanged(nameof(ShowDisconnectButton));
+        OnPropertyChanged(nameof(ShowCancelButton));
+        OnPropertyChanged(nameof(CanUpdateBridgeDb));
+    }
+
+    partial void OnIsPreparingConnectionChanged(bool value)
     {
         OnPropertyChanged(nameof(IsBusy));
         OnPropertyChanged(nameof(ShowConnectButton));
@@ -1173,9 +1183,15 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         }
 
         var baseOptions = BuildConnectOptions();
+        BeginConnectionPreparation(SmartConnectEnabled);
 
         try
         {
+            UpdatePreparationStatus(
+                SmartConnectEnabled
+                    ? "Smart Connect is analyzing the network and preparing the best route..."
+                    : "Preparing Tor connection...",
+                0.03);
             var strategies = await BuildConnectStrategiesAsync(baseOptions, _connectCts.Token);
             for (var index = 0; index < strategies.Count; index++)
             {
@@ -1183,6 +1199,12 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
 
                 var strategy = strategies[index];
                 var attemptOptions = strategy.Options;
+
+                UpdatePreparationStatus(
+                    SmartConnectEnabled
+                        ? $"Smart Connect selected strategy {index + 1}/{strategies.Count}: {strategy.Name}."
+                        : "Checking connectivity and local Tor components...",
+                    Math.Min(0.08 + (index * 0.04), 0.18));
 
                 if (SmartConnectEnabled &&
                     attemptOptions.OnionDnsProxyEnabled &&
@@ -1226,13 +1248,47 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         }
         catch (OperationCanceledException)
         {
+            if (!IsConnected && !IsConnecting && !IsDisconnecting)
+            {
+                ConnectionStatus = LocalizationService.Get("Status.Disconnected");
+                StatusMessage = "Connection canceled.";
+                ConnectionProgress = 0;
+            }
         }
         catch (Exception ex)
         {
             OnionHopV2.Core.Services.StartupLogger.Write($"ConnectAsync EXCEPTION: {ex.GetType().Name}: {ex.Message}");
             OnionHopV2.Core.Services.StartupLogger.Write($"Stack trace: {ex.StackTrace}");
+            ConnectionStatus = LocalizationService.Get("Status.Disconnected");
             StatusMessage = $"Connection failed: {ex.Message}";
+            ConnectionProgress = 0;
         }
+        finally
+        {
+            IsPreparingConnection = false;
+        }
+    }
+
+    private void BeginConnectionPreparation(bool smartConnect)
+    {
+        IsPreparingConnection = true;
+        ConnectionStatus = LocalizationService.Get("Status.Connecting");
+        StatusMessage = smartConnect
+            ? "Smart Connect is preparing a connection strategy..."
+            : "Preparing Tor connection...";
+        ConnectionProgress = 0.02;
+    }
+
+    private void UpdatePreparationStatus(string message, double progress)
+    {
+        if (!IsPreparingConnection || IsConnecting || IsConnected || IsDisconnecting)
+        {
+            return;
+        }
+
+        ConnectionStatus = LocalizationService.Get("Status.Connecting");
+        StatusMessage = message;
+        ConnectionProgress = Math.Max(ConnectionProgress, progress);
     }
 
     private async Task<IReadOnlyList<SmartConnectAdvisor.Strategy>> BuildConnectStrategiesAsync(
@@ -1346,7 +1402,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     [RelayCommand]
     private void CancelConnect()
     {
-        if (!IsConnecting)
+        if (!IsPreparingConnection && !IsConnecting)
         {
             return;
         }

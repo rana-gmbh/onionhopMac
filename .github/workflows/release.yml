@@ -301,5 +301,5 @@ jobs:
             - Universal app bundle for Apple Silicon and Intel Macs
           files: ${{ env.DMG_PATH }}
           draft: false
-          prerelease: false
-          make_latest: true
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          make_latest: ${{ !contains(steps.version.outputs.version, '-') }}

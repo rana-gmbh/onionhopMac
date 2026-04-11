@@ -1254,7 +1254,74 @@ internal sealed class TorBridgeManager
 
     public static string NormalizeClientTransportPlugin(string pluginLine)
     {
-        return pluginLine.Trim();
+        var trimmed = pluginLine.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return trimmed;
+        }
+
+        const string execToken = " exec ";
+        var execIndex = trimmed.IndexOf(execToken, StringComparison.OrdinalIgnoreCase);
+        if (execIndex < 0)
+        {
+            return trimmed;
+        }
+
+        var prefix = trimmed[..(execIndex + execToken.Length)];
+        var suffix = trimmed[(execIndex + execToken.Length)..].TrimStart();
+        if (suffix.Length == 0 || suffix[0] == '"')
+        {
+            return trimmed;
+        }
+
+        var tokens = suffix.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (tokens.Length <= 1)
+        {
+            return trimmed;
+        }
+
+        var executableTokenCount = 1;
+        while (executableTokenCount < tokens.Length &&
+               !tokens[executableTokenCount].StartsWith("-", StringComparison.Ordinal))
+        {
+            executableTokenCount++;
+        }
+
+        if (executableTokenCount <= 1)
+        {
+            return trimmed;
+        }
+
+        var executablePath = string.Join(" ", tokens.Take(executableTokenCount));
+        if (!LooksLikeTransportExecutablePath(executablePath))
+        {
+            return trimmed;
+        }
+
+        var builder = new StringBuilder(prefix.Length + suffix.Length + 4);
+        builder.Append(prefix);
+        builder.Append('"');
+        builder.Append(executablePath.Replace("\"", "\\\"", StringComparison.Ordinal));
+        builder.Append('"');
+
+        if (executableTokenCount < tokens.Length)
+        {
+            builder.Append(' ');
+            builder.Append(string.Join(" ", tokens.Skip(executableTokenCount)));
+        }
+
+        return builder.ToString();
+    }
+
+    private static bool LooksLikeTransportExecutablePath(string value)
+    {
+        return value.Contains(Path.DirectorySeparatorChar)
+            || value.Contains(Path.AltDirectorySeparatorChar)
+            || value.Contains(":\\", StringComparison.Ordinal)
+            || value.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            || value.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)
+            || value.EndsWith(".cmd", StringComparison.OrdinalIgnoreCase)
+            || value.EndsWith(".sh", StringComparison.OrdinalIgnoreCase);
     }
 
     private static IReadOnlyList<string> BuildFallbackTransportPlugins(IReadOnlyCollection<string> transports, string ptRelativePath, string? webTunnelPlugin)

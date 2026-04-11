@@ -158,4 +158,26 @@ public sealed class TorBridgeManagerTests
         Assert.Contains(keys, key => string.Equals(key, "custom", StringComparison.OrdinalIgnoreCase));
         Assert.Equal("custom", Assert.Single(keys.Skip(Math.Max(0, keys.Count - 1))));
     }
+
+    [Fact]
+    public void NormalizeClientTransportPlugin_quotes_executable_paths_with_spaces()
+    {
+        var plugin = "ClientTransportPlugin snowflake exec /Users/test/Library/Application Support/OnionHop/tor/pluggable_transports/lyrebird -ampcache https://cdn.ampproject.org/";
+
+        var normalized = TorBridgeManager.NormalizeClientTransportPlugin(plugin);
+
+        Assert.Equal(
+            "ClientTransportPlugin snowflake exec \"/Users/test/Library/Application Support/OnionHop/tor/pluggable_transports/lyrebird\" -ampcache https://cdn.ampproject.org/",
+            normalized);
+    }
+
+    [Fact]
+    public void NormalizeClientTransportPlugin_preserves_already_quoted_executable_paths()
+    {
+        var plugin = "ClientTransportPlugin webtunnel exec \"/Users/test/Library/Application Support/OnionHop/tor/pluggable_transports/webtunnel-client\" -url https://example.test/";
+
+        var normalized = TorBridgeManager.NormalizeClientTransportPlugin(plugin);
+
+        Assert.Equal(plugin, normalized);
+    }
 }
