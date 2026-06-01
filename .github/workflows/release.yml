@@ -45,6 +45,42 @@ jobs:
             echo "version=$(date +%Y.%m.%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Set up Go (pluggable transports)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build macOS pluggable transports (webtunnel, dnstt)
+        run: |
+          set -euo pipefail
+          # The macOS Tor bundle ships lyrebird (obfs4/meek/snowflake) and conjure-client, but not
+          # the webtunnel or dnstt clients - those are standalone Go programs. Build them as universal
+          # (arm64 + x86_64) binaries and stage them in pluggable_transports so the dotnet publish glob
+          # copies them into the .app. Without webtunnel-client, webtunnel bridges fail at connect with
+          # "Webtunnel client is missing".
+          PT="OnionHop/tor/pluggable_transports"
+          mkdir -p "$PT"
+
+          build_universal() {
+            name="$1"; srcdir="$2"; pkg="$3"
+            ( cd "$srcdir" && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "/tmp/${name}-arm64" "$pkg" )
+            ( cd "$srcdir" && CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "/tmp/${name}-amd64" "$pkg" )
+            lipo -create "/tmp/${name}-arm64" "/tmp/${name}-amd64" -output "$PT/${name}"
+            chmod +x "$PT/${name}"
+            file "$PT/${name}"
+            lipo -archs "$PT/${name}"
+          }
+
+          # webtunnel-client (v0.0.3, matching download-deps)
+          curl -fsSL "https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/webtunnel/-/archive/v0.0.3/webtunnel-v0.0.3.tar.gz" -o /tmp/webtunnel.tar.gz
+          mkdir -p /tmp/webtunnel
+          tar -xzf /tmp/webtunnel.tar.gz -C /tmp/webtunnel --strip-components=1
+          build_universal "webtunnel-client" "/tmp/webtunnel" "./main/client"
+
+          # dnstt-client (bamsoftware; full clone - its dumb-HTTP server rejects shallow fetches)
+          git clone https://www.bamsoftware.com/git/dnstt.git /tmp/dnstt
+          build_universal "dnstt-client" "/tmp/dnstt/dnstt-client" "."
+
       - name: Publish for macOS (arm64)
         run: |
           export MACOSX_DEPLOYMENT_TARGET="${{ env.MIN_MACOS_VERSION }}"
