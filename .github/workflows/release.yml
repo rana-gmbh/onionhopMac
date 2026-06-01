@@ -96,6 +96,35 @@ jobs:
             fi
           done < <(find build/x64 -type f -print0)
 
+      - name: Build macOS Swift helper
+        run: |
+          # The Swift helper (onionhop-mac-helper) performs OnionHop's elevated macOS operations:
+          # system proxy, /etc/resolver/onion DNS, pf kill switch, and NetworkExtension tunnel
+          # control. The app finds it under macos/OnionHopMacHelper/ next to the executable, so it
+          # must ship inside the bundle for TUN/VPN mode to work without manual setup.
+          chmod +x macos/OnionHopMacHelper/build.sh
+          ./macos/OnionHopMacHelper/build.sh
+          file macos/OnionHopMacHelper/onionhop-mac-helper
+
+      - name: Fetch macOS sing-box (universal)
+        run: |
+          # sing-box is the TUN core for the osascript (admin-prompt) tunnel path. Fetch the latest
+          # universal macOS build and place it where the app looks: vpn/sing-box.
+          SB_JSON=$(curl -sSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)
+          SB_URL=$(echo "$SB_JSON" | grep -oE '"browser_download_url": *"[^"]*darwin-universal[^"]*\.tar\.gz"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/')
+          if [ -z "$SB_URL" ]; then
+            # Fall back to arm64 if no universal asset is published.
+            SB_URL=$(echo "$SB_JSON" | grep -oE '"browser_download_url": *"[^"]*darwin-arm64[^"]*\.tar\.gz"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/')
+          fi
+          echo "sing-box url: $SB_URL"
+          mkdir -p build/macos-vpn
+          curl -sSL "$SB_URL" -o /tmp/sing-box.tar.gz
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          SB_BIN=$(find /tmp -type f -name sing-box -perm +111 | head -1)
+          cp "$SB_BIN" build/macos-vpn/sing-box
+          chmod +x build/macos-vpn/sing-box
+          file build/macos-vpn/sing-box
+
       - name: Create .app bundle
         run: |
           APP="publish/${{ env.APP_NAME }}.app"
@@ -105,10 +134,20 @@ jobs:
           # Copy all published files into MacOS
           cp -R build/universal-full/* "$APP/Contents/MacOS/"
 
-          # Ensure tor binaries are executable
+          # Bundle the Swift helper where MacSwiftHelper.ResolveHelperPath looks for it.
+          mkdir -p "$APP/Contents/MacOS/macos/OnionHopMacHelper"
+          cp macos/OnionHopMacHelper/onionhop-mac-helper "$APP/Contents/MacOS/macos/OnionHopMacHelper/onionhop-mac-helper"
+
+          # Bundle the macOS sing-box TUN core where the app looks: vpn/sing-box.
+          mkdir -p "$APP/Contents/MacOS/vpn"
+          cp build/macos-vpn/sing-box "$APP/Contents/MacOS/vpn/sing-box"
+
+          # Ensure native binaries are executable
           chmod +x "$APP/Contents/MacOS/tor/tor" 2>/dev/null || true
           chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/lyrebird" 2>/dev/null || true
           chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/conjure-client" 2>/dev/null || true
+          chmod +x "$APP/Contents/MacOS/macos/OnionHopMacHelper/onionhop-mac-helper" 2>/dev/null || true
+          chmod +x "$APP/Contents/MacOS/vpn/sing-box" 2>/dev/null || true
 
           # Copy icon if available
           if [ -f ${{ env.APP_PROJECT }}/Assets/logo.png ]; then
