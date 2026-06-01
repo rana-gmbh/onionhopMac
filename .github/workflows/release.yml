@@ -107,23 +107,39 @@ jobs:
           file macos/OnionHopMacHelper/onionhop-mac-helper
 
       - name: Fetch macOS sing-box (universal)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # sing-box is the TUN core for the osascript (admin-prompt) tunnel path. Fetch the latest
-          # universal macOS build and place it where the app looks: vpn/sing-box.
-          SB_JSON=$(curl -sSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)
-          SB_URL=$(echo "$SB_JSON" | grep -oE '"browser_download_url": *"[^"]*darwin-universal[^"]*\.tar\.gz"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/')
-          if [ -z "$SB_URL" ]; then
-            # Fall back to arm64 if no universal asset is published.
-            SB_URL=$(echo "$SB_JSON" | grep -oE '"browser_download_url": *"[^"]*darwin-arm64[^"]*\.tar\.gz"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/')
+          # sing-box is the TUN core for the osascript (admin-prompt) tunnel path. SagerNet publishes
+          # separate darwin-amd64 and darwin-arm64 builds (no universal asset), so fetch both and lipo
+          # them into a universal binary at vpn/sing-box (where the app looks).
+          mkdir -p build/macos-vpn /tmp/sb-amd64 /tmp/sb-arm64
+
+          AMD64_URL=$(gh api repos/SagerNet/sing-box/releases/latest \
+            --jq '.assets[] | select(.name | test("darwin-amd64\\.tar\\.gz$")) | .browser_download_url')
+          ARM64_URL=$(gh api repos/SagerNet/sing-box/releases/latest \
+            --jq '.assets[] | select(.name | test("darwin-arm64\\.tar\\.gz$")) | .browser_download_url')
+          echo "amd64: $AMD64_URL"
+          echo "arm64: $ARM64_URL"
+          if [ -z "$AMD64_URL" ] || [ -z "$ARM64_URL" ]; then
+            echo "::error::Could not resolve sing-box darwin asset URLs"; exit 1
           fi
-          echo "sing-box url: $SB_URL"
-          mkdir -p build/macos-vpn
-          curl -sSL "$SB_URL" -o /tmp/sing-box.tar.gz
-          tar -xzf /tmp/sing-box.tar.gz -C /tmp
-          SB_BIN=$(find /tmp -type f -name sing-box -perm +111 | head -1)
-          cp "$SB_BIN" build/macos-vpn/sing-box
+
+          curl -fsSL "$AMD64_URL" -o /tmp/sb-amd64.tar.gz
+          curl -fsSL "$ARM64_URL" -o /tmp/sb-arm64.tar.gz
+          tar -xzf /tmp/sb-amd64.tar.gz -C /tmp/sb-amd64
+          tar -xzf /tmp/sb-arm64.tar.gz -C /tmp/sb-arm64
+
+          SB_AMD64=$(find /tmp/sb-amd64 -type f -name sing-box | head -1)
+          SB_ARM64=$(find /tmp/sb-arm64 -type f -name sing-box | head -1)
+          if [ -z "$SB_AMD64" ] || [ -z "$SB_ARM64" ]; then
+            echo "::error::sing-box binary not found in archives"; exit 1
+          fi
+
+          lipo -create "$SB_AMD64" "$SB_ARM64" -output build/macos-vpn/sing-box
           chmod +x build/macos-vpn/sing-box
           file build/macos-vpn/sing-box
+          lipo -archs build/macos-vpn/sing-box
 
       - name: Create .app bundle
         run: |
