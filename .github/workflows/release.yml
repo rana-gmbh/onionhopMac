@@ -16,8 +16,10 @@ permissions:
 env:
   DOTNET_VERSION: '9.0.x'
   APP_NAME: OnionHop
-  BUNDLE_ID: com.onionhop.v2
+  BUNDLE_ID: com.onionhop.v3
   PUBLISH_DIR: publish/OnionHop.app
+  APP_PROJECT: OnionHop/src/OnionHopV3.App
+  EXE_NAME: OnionHopV3
   MIN_MACOS_VERSION: '14.0'
 
 jobs:
@@ -46,7 +48,7 @@ jobs:
       - name: Publish for macOS (arm64)
         run: |
           export MACOSX_DEPLOYMENT_TARGET="${{ env.MIN_MACOS_VERSION }}"
-          dotnet publish src/OnionHopV2.App \
+          dotnet publish ${{ env.APP_PROJECT }} \
             -c Release \
             -r osx-arm64 \
             --self-contained true \
@@ -58,7 +60,7 @@ jobs:
       - name: Publish for macOS (x64)
         run: |
           export MACOSX_DEPLOYMENT_TARGET="${{ env.MIN_MACOS_VERSION }}"
-          dotnet publish src/OnionHopV2.App \
+          dotnet publish ${{ env.APP_PROJECT }} \
             -c Release \
             -r osx-x64 \
             --self-contained true \
@@ -109,8 +111,8 @@ jobs:
           chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/conjure-client" 2>/dev/null || true
 
           # Copy icon if available
-          if [ -f src/OnionHopV2.App/Assets/logo.png ]; then
-            cp src/OnionHopV2.App/Assets/logo.png "$APP/Contents/Resources/AppIcon.png"
+          if [ -f ${{ env.APP_PROJECT }}/Assets/logo.png ]; then
+            cp ${{ env.APP_PROJECT }}/Assets/logo.png "$APP/Contents/Resources/AppIcon.png"
           fi
 
           # Create Info.plist
@@ -131,7 +133,7 @@ jobs:
             <key>CFBundleShortVersionString</key>
             <string>${VERSION}</string>
             <key>CFBundleExecutable</key>
-            <string>OnionHopV2</string>
+            <string>OnionHopV3</string>
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleIconFile</key>

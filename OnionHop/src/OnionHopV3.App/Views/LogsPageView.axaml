@@ -1,0 +1,297 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:controls="using:OnionHopV3.App.Controls"
+             xmlns:vm="using:OnionHopV3.App.ViewModels"
+             mc:Ignorable="d"
+             d:DesignWidth="1200"
+             d:DesignHeight="820"
+             x:Class="OnionHopV3.App.Views.LogsPageView"
+             x:DataType="vm:LogsPageViewModel">
+
+  <Grid RowDefinitions="Auto,*"
+        RowSpacing="14">
+    <!-- Source tabs. The Copy/Export/Clear actions used to sit at this row's right edge but were
+         hidden under the window caption buttons; they now live in their own row above the log card.
+         A right inset keeps the tab row itself clear of the caption buttons. -->
+    <WrapPanel Orientation="Horizontal"
+               HorizontalAlignment="Left"
+               VerticalAlignment="Center"
+               Margin="0,0,116,0">
+      <RadioButton Classes="TabChip"
+                   GroupName="LogSource"
+                   IsChecked="{Binding IsAppSelected}"
+                   Content="{DynamicResource Logs.TabApp}"
+                   Width="140"
+                   Height="40"
+                   Margin="0,0,10,0" />
+      <RadioButton Classes="TabChip"
+                   GroupName="LogSource"
+                   IsChecked="{Binding IsDnsSelected}"
+                   Content="{DynamicResource Logs.TabDns}"
+                   Width="140"
+                   Height="40"
+                   Margin="0,0,10,0" />
+      <RadioButton Classes="TabChip"
+                   GroupName="LogSource"
+                   IsChecked="{Binding IsEngineSelected}"
+                   Content="{Binding EngineTabLabel}"
+                   Width="140"
+                   Height="40"
+                   Margin="0,0,10,0" />
+    </WrapPanel>
+
+    <Grid Grid.Row="1"
+          ColumnDefinitions="2.1*,0.9*"
+          ColumnSpacing="18"
+          MinHeight="0">
+      <Border Classes="SectionCard">
+        <Grid RowDefinitions="Auto,Auto,*"
+              RowSpacing="12"
+              MinHeight="0">
+          <!-- Top row: search bar on the left aligned with the Copy / Export / Clear actions on the
+               right, so the search field lines up with the buttons. -->
+          <Grid ColumnDefinitions="*,Auto"
+                ColumnSpacing="12">
+            <TextBox Text="{Binding SearchText}"
+                     VerticalAlignment="Center"
+                     Watermark="{DynamicResource Logs.Search}" />
+            <StackPanel Grid.Column="1"
+                        Orientation="Horizontal"
+                        Spacing="8"
+                        VerticalAlignment="Center">
+              <Button Classes="ActionGhost"
+                      Click="OnCopyCurrentTabClick"
+                      Content="{DynamicResource Logs.Copy}" />
+              <Button Classes="ActionGhost"
+                      Click="OnExportCurrentTabClick"
+                      Content="{DynamicResource Logs.Export}" />
+              <Button Classes="ActionDanger"
+                      Command="{Binding ClearSelectedLogsCommand}"
+                      Content="{DynamicResource Logs.Clear}" />
+            </StackPanel>
+          </Grid>
+
+          <!-- Second row: level filters on the left, Pause / Auto-scroll toggles on the right. -->
+          <Grid Grid.Row="1"
+                ColumnDefinitions="*,Auto"
+                ColumnSpacing="12">
+            <WrapPanel Orientation="Horizontal"
+                       VerticalAlignment="Center">
+            <RadioButton Classes="FilterChip"
+                         GroupName="LogLevel"
+                         IsChecked="{Binding IsAllSelected}"
+                         Content="{DynamicResource Logs.FilterAll}"
+                         Width="120"
+                         Height="38"
+                         Margin="0,0,10,0" />
+            <RadioButton Classes="FilterChip"
+                         GroupName="LogLevel"
+                         IsChecked="{Binding IsInfoSelected}"
+                         Content="{DynamicResource Logs.LevelInfo}"
+                         Width="120"
+                         Height="38"
+                         Margin="0,0,10,0" />
+            <RadioButton Classes="FilterChip"
+                         GroupName="LogLevel"
+                         IsChecked="{Binding IsWarningSelected}"
+                         Content="{DynamicResource Logs.LevelWarning}"
+                         Width="120"
+                         Height="38"
+                         Margin="0,0,10,0" />
+            <RadioButton Classes="FilterChip"
+                         GroupName="LogLevel"
+                         IsChecked="{Binding IsErrorSelected}"
+                         Content="{DynamicResource Logs.LevelError}"
+                         Width="120"
+                         Height="38" />
+            </WrapPanel>
+
+            <StackPanel Grid.Column="1"
+                        Orientation="Horizontal"
+                        Spacing="16"
+                        VerticalAlignment="Center">
+              <StackPanel Orientation="Horizontal"
+                          Spacing="8"
+                          VerticalAlignment="Center">
+                <TextBlock Text="{DynamicResource Logs.Pause}"
+                           Classes="SectionCaption"
+                           VerticalAlignment="Center" />
+                <ToggleButton Classes="V3Switch"
+                              IsChecked="{Binding IsPaused}"
+                              ToolTip.Tip="{DynamicResource Logs.Pause}" />
+              </StackPanel>
+              <StackPanel Orientation="Horizontal"
+                          Spacing="8"
+                          VerticalAlignment="Center">
+                <TextBlock Text="{DynamicResource Logs.AutoScroll}"
+                           Classes="SectionCaption"
+                           VerticalAlignment="Center" />
+                <ToggleButton Classes="V3Switch"
+                              IsChecked="{Binding AutoScroll}"
+                              ToolTip.Tip="{DynamicResource Logs.AutoScroll}" />
+              </StackPanel>
+            </StackPanel>
+          </Grid>
+
+          <Border Grid.Row="2"
+                  Classes="InsetPanel"
+                  Padding="0"
+                  MinHeight="0">
+            <Grid RowDefinitions="Auto,*"
+                  MinHeight="0">
+              <Grid ColumnDefinitions="82,86,138,*"
+                    ColumnSpacing="10"
+                    Margin="14,12,14,10">
+                <TextBlock Text="{DynamicResource Logs.ColumnTime}"
+                           Classes="SectionCaption" />
+                <TextBlock Grid.Column="1"
+                           Text="{DynamicResource Logs.ColumnLevel}"
+                           Classes="SectionCaption" />
+                <TextBlock Grid.Column="2"
+                           Text="{DynamicResource Logs.ColumnSource}"
+                           Classes="SectionCaption" />
+                <TextBlock Grid.Column="3"
+                           Text="{DynamicResource Logs.ColumnMessage}"
+                           Classes="SectionCaption" />
+              </Grid>
+
+              <!-- ListBox (not ItemsControl) so the log rows are virtualized: only the visible
+                   rows get realized, instead of building a visual for every one of up to 2000
+                   entries. That, plus incremental append in the view model, is what stops the log
+                   view from pegging CPU and ballooning memory during long/failed connects. -->
+              <ListBox x:Name="EntriesListBox"
+                       Grid.Row="1"
+                       ItemsSource="{Binding VisibleEntries}"
+                       ScrollViewer.VerticalScrollBarVisibility="Auto"
+                       MinHeight="0"
+                       Background="Transparent"
+                       BorderThickness="0"
+                       Padding="0">
+                <ListBox.Styles>
+                  <!-- Keep the custom row template flush: the ListBoxItem chrome adds its own
+                       padding/min-height otherwise. -->
+                  <Style Selector="ListBoxItem">
+                    <Setter Property="Padding" Value="0" />
+                    <Setter Property="Margin" Value="0" />
+                    <Setter Property="MinHeight" Value="0" />
+                  </Style>
+                </ListBox.Styles>
+                <ListBox.ItemTemplate>
+                  <DataTemplate x:DataType="vm:StructuredLogEntry">
+                    <Border BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}"
+                            BorderThickness="0,1,0,0"
+                            Padding="14,10">
+                      <Grid ColumnDefinitions="82,86,138,*"
+                            ColumnSpacing="10">
+                        <TextBlock Text="{Binding Time}"
+                                   FontFamily="Consolas"
+                                   VerticalAlignment="Top"
+                                   Foreground="{DynamicResource TextSecondaryBrush}" />
+                        <controls:StatusBadge Grid.Column="1"
+                                              VerticalAlignment="Top"
+                                              Text="{Binding LevelLabel}"
+                                              Tone="{Binding LevelTone}" />
+                        <TextBlock Grid.Column="2"
+                                   Text="{Binding Source}"
+                                   VerticalAlignment="Top"
+                                   Foreground="{DynamicResource TextSecondaryBrush}" />
+                        <TextBlock Grid.Column="3"
+                                   Text="{Binding Message}"
+                                   FontFamily="Consolas"
+                                   TextWrapping="Wrap" />
+                      </Grid>
+                    </Border>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+
+              <controls:EmptyState Grid.Row="1"
+                                   Margin="20"
+                                   Title="{DynamicResource Logs.EmptyTitle}"
+                                   Description="{DynamicResource Logs.EmptyDescription}"
+                                   Icon="TextBoxOutline"
+                                   IsVisible="{Binding ShowEmptyState}" />
+            </Grid>
+          </Border>
+        </Grid>
+      </Border>
+
+      <Border Grid.Column="1"
+              Classes="SectionCard">
+        <StackPanel Spacing="12">
+          <TextBlock Text="{DynamicResource Logs.Summary}"
+                     Classes="SectionTitle" />
+          <Grid ColumnDefinitions="*,*"
+                RowDefinitions="Auto,Auto,Auto"
+                ColumnSpacing="10"
+                RowSpacing="10">
+            <Border Classes="InsetPanel">
+              <StackPanel Spacing="4">
+                <TextBlock Text="{DynamicResource Logs.TotalEntries}"
+                           Classes="SectionCaption" />
+                <TextBlock Text="{Binding TotalEntries}"
+                           FontSize="24"
+                           FontWeight="SemiBold" />
+              </StackPanel>
+            </Border>
+            <Border Grid.Column="1"
+                    Classes="InsetPanel">
+              <StackPanel Spacing="4">
+                <TextBlock Text="{DynamicResource Logs.ActiveSources}"
+                           Classes="SectionCaption" />
+                <TextBlock Text="{Binding ActiveSourcesSummary}"
+                           TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="1"
+                    Classes="InsetPanel">
+              <StackPanel Spacing="4">
+                <TextBlock Text="{DynamicResource Logs.LevelError}"
+                           Classes="SectionCaption" />
+                <TextBlock Text="{Binding ErrorEntries}"
+                           FontSize="22"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource DangerBrush}" />
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="1"
+                    Grid.Column="1"
+                    Classes="InsetPanel">
+              <StackPanel Spacing="4">
+                <TextBlock Text="{DynamicResource Logs.LevelWarning}"
+                           Classes="SectionCaption" />
+                <TextBlock Text="{Binding WarningEntries}"
+                           FontSize="22"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource WarningBrush}" />
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="2"
+                    Classes="InsetPanel">
+              <StackPanel Spacing="4">
+                <TextBlock Text="{DynamicResource Logs.LevelInfo}"
+                           Classes="SectionCaption" />
+                <TextBlock Text="{Binding InfoEntries}"
+                           FontSize="22"
+                           FontWeight="SemiBold"
+                           Foreground="{DynamicResource InfoBrush}" />
+              </StackPanel>
+            </Border>
+            <Border Grid.Row="2"
+                    Grid.Column="1"
+                    Classes="InsetPanel">
+              <StackPanel Spacing="4">
+                <TextBlock Text="{DynamicResource Logs.TipHeader}"
+                           Classes="SectionCaption" />
+                <TextBlock Text="{DynamicResource Logs.TipLocalOnly}"
+                           TextWrapping="Wrap" />
+              </StackPanel>
+            </Border>
+          </Grid>
+        </StackPanel>
+      </Border>
+    </Grid>
+  </Grid>
+</UserControl>
