@@ -375,6 +375,10 @@ jobs:
           security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
 
       - name: Upload DMG artifact
+        # Best-effort run artifact (handy for workflow_dispatch builds). Must not fail the job: the
+        # actual release attaches the DMG directly from disk in the next step. If the org's Actions
+        # artifact-storage quota is hit, skip this and still publish the release.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: OnionHop-macOS-dmg
