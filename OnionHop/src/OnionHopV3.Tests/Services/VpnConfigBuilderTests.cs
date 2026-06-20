@@ -265,6 +265,63 @@ public sealed class VpnConfigBuilderTests
         Assert.False(tunInbound.TryGetProperty("mtu", out _));
     }
 
+    [Fact]
+    public void Custom_interface_name_is_used_for_tun_inbound()
+    {
+        // The VPN service hands each connect a unique adapter name (e.g. "OnionHop3f2a") so a
+        // leftover Wintun adapter from a racing teardown can never collide with the new one. The
+        // builder must put exactly that name on the TUN inbound.
+        var json = VpnConfigBuilder.BuildJson(
+            hybridRouting: false,
+            secureDns: false,
+            socksPort: 9050,
+            torAppProcessNames: [],
+            bypassAppProcessNames: [],
+            routeAllWebTrafficThroughTor: false,
+            blockQuicForTorApps: false,
+            blockUdpTraffic: true,
+            dohServer: null,
+            dohServerPort: 443,
+            dohPath: null,
+            tunStack: "mixed",
+            tunMtu: null,
+            tunStrictRoute: true,
+            interfaceName: "OnionHop3f2a");
+
+        var doc = JsonDocument.Parse(json);
+        var tunInbound = doc.RootElement.GetProperty("inbounds")[0];
+        Assert.Equal("OnionHop3f2a", tunInbound.GetProperty("interface_name").GetString());
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Missing_interface_name_falls_back_to_default(string? interfaceName)
+    {
+        var json = VpnConfigBuilder.BuildJson(
+            hybridRouting: false,
+            secureDns: false,
+            socksPort: 9050,
+            torAppProcessNames: [],
+            bypassAppProcessNames: [],
+            routeAllWebTrafficThroughTor: false,
+            blockQuicForTorApps: false,
+            blockUdpTraffic: true,
+            dohServer: null,
+            dohServerPort: 443,
+            dohPath: null,
+            tunStack: "mixed",
+            tunMtu: null,
+            tunStrictRoute: true,
+            interfaceName: interfaceName);
+
+        var doc = JsonDocument.Parse(json);
+        var tunInbound = doc.RootElement.GetProperty("inbounds")[0];
+        var expected = System.OperatingSystem.IsMacOS() ? "utun99" : "OnionHop";
+        Assert.Equal(expected, tunInbound.GetProperty("interface_name").GetString());
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -364,5 +421,54 @@ public sealed class VpnConfigBuilderTests
         Assert.Contains(bypassNames, n => n is "artihop.exe" or "artihop");
         Assert.Contains(bypassNames, n => n is "webtunnel-client.exe" or "webtunnel-client");
         Assert.Contains(bypassNames, n => n is "dnstt-client.exe" or "dnstt-client");
+    }
+
+    [Fact]
+    public void Routing_rules_bypass_and_block_domains_and_ips()
+    {
+        var json = VpnConfigBuilder.BuildJson(
+            hybridRouting: false,
+            secureDns: false,
+            socksPort: 9050,
+            torAppProcessNames: [],
+            bypassAppProcessNames: [],
+            routeAllWebTrafficThroughTor: false,
+            blockQuicForTorApps: false,
+            blockUdpTraffic: true,
+            dohServer: null,
+            dohServerPort: 443,
+            dohPath: null,
+            tunStack: "mixed",
+            tunMtu: null,
+            tunStrictRoute: true,
+            interfaceName: null,
+            bypassRoutingEntries: ["example.com", "10.0.0.0/8", "# a comment", "https://foo.bar/path"],
+            blockRoutingEntries: ["ads.tracker.net", "1.2.3.4"]);
+
+        var rules = JsonDocument.Parse(json).RootElement.GetProperty("route").GetProperty("rules");
+        bool bypassDomain = false, bypassIp = false, blockDomain = false, blockIp = false, normalizedUrl = false;
+        foreach (var r in rules.EnumerateArray())
+        {
+            var ob = r.TryGetProperty("outbound", out var o) ? o.GetString() : null;
+            if (r.TryGetProperty("domain_suffix", out var ds))
+            {
+                var list = ds.EnumerateArray().Select(e => e.GetString()).ToList();
+                if (ob == "direct" && list.Contains("example.com")) bypassDomain = true;
+                if (ob == "direct" && list.Contains("foo.bar")) normalizedUrl = true;
+                if (ob == "block" && list.Contains("ads.tracker.net")) blockDomain = true;
+            }
+            if (r.TryGetProperty("ip_cidr", out var ic))
+            {
+                var list = ic.EnumerateArray().Select(e => e.GetString()).ToList();
+                if (ob == "direct" && list.Contains("10.0.0.0/8")) bypassIp = true;
+                if (ob == "block" && list.Contains("1.2.3.4")) blockIp = true;
+            }
+        }
+
+        Assert.True(bypassDomain, "domain bypass rule (direct) missing");
+        Assert.True(bypassIp, "ip_cidr bypass rule (direct) missing");
+        Assert.True(blockDomain, "domain block rule missing");
+        Assert.True(blockIp, "ip block rule missing");
+        Assert.True(normalizedUrl, "a url entry should be normalized to its host");
     }
 }

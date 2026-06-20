@@ -166,6 +166,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         nameof(BlockUdpTraffic),
         nameof(HybridTorApps),
         nameof(HybridBypassApps),
+        nameof(BypassRoutingRules),
+        nameof(BlockRoutingRules),
         nameof(SelectedLanguage),
         nameof(SelectedAccentColor),
         nameof(SelectedTorEngineMode),
@@ -315,6 +317,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         _client.StatusUpdated += (_, update) => Dispatcher.UIThread.Post(() => ApplyClientStatus(update));
         _client.DependencyUpdated += (_, update) => Dispatcher.UIThread.Post(() => ApplyDependencyUpdate(update));
         _client.SnowflakeProxyStatusUpdated += (_, status) => Dispatcher.UIThread.Post(() => ApplySnowflakeProxyStatus(status));
+        _client.BridgesApplied += (_, lines) => Dispatcher.UIThread.Post(() => SetActiveBridges(lines));
         StartLogPump();
         LastBridgeDataUpdateUtc = _client.GetLastBridgeDataUpdateUtc();
 
@@ -353,6 +356,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     public ObservableCollection<LocalizedOption> ConnectionPaddingModeOptions { get; } = [];
 
     public ObservableCollection<string> LogLines { get; } = [];
+    // The bridge line(s) the current connection is using (issue #56), shown as a copyable Logs tab.
+    public ObservableCollection<string> ActiveBridgeLines { get; } = [];
     public ObservableCollection<string> DnsLogLines { get; } = [];
     public ObservableCollection<string> XrayLogLines { get; } = [];
     public string TunEngineLogTabHeader => string.Equals(
@@ -451,6 +456,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private bool _hybridBlockQuicForTorApps = true;
     [ObservableProperty] private string _hybridTorApps = string.Empty;
     [ObservableProperty] private string _hybridBypassApps = string.Empty;
+    // Routing rules (issue #55): domains / IP ranges to send direct (bypass Tor) or block, in TUN mode.
+    [ObservableProperty] private string _bypassRoutingRules = string.Empty;
+    [ObservableProperty] private string _blockRoutingRules = string.Empty;
 
     /// <summary>One-line summary of the per-app split-tunnel rules, shown under the picker button.</summary>
     public string HybridAppsSummary
@@ -532,6 +540,25 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     public bool CanSelectExitLocation => !IsManualExitNodeFingerprintSet;
     public bool CanSelectEntryLocation => !UseTorBridges && !IsManualEntryNodeFingerprintSet;
     public bool IsCustomDoh => string.Equals(SelectedDnsProvider, DnsProviderCustom, StringComparison.Ordinal);
+
+    // The DNS provider dropdown binds here, NOT directly to SelectedDnsProvider (issue #57). Avalonia
+    // ComboBoxes push a null SelectedItem when the Settings page is navigated away (detached); binding
+    // that straight into SelectedDnsProvider wiped the saved value, which then reloaded as the default.
+    // Every other settings dropdown is insulated the same way via its *Option object; this is the one
+    // that was bound to the raw string. Dropping null/empty writes here keeps the user's choice.
+    public string SelectedDnsProviderChoice
+    {
+        get => SelectedDnsProvider;
+        set
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return;
+            }
+
+            SelectedDnsProvider = value;
+        }
+    }
     public bool UseCustomBridges => string.Equals(SelectedBridgeType, "custom", StringComparison.OrdinalIgnoreCase);
     public bool IsSnowflakeBridgeSelected => string.Equals(SelectedBridgeType, "snowflake", StringComparison.OrdinalIgnoreCase);
     public bool IsWindows => OperatingSystem.IsWindows();
@@ -959,6 +986,19 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         else
         {
             StopConnectionElapsedTimer();
+            ActiveBridgeLines.Clear();
+        }
+    }
+
+    private void SetActiveBridges(IReadOnlyList<string> lines)
+    {
+        ActiveBridgeLines.Clear();
+        foreach (var line in lines)
+        {
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                ActiveBridgeLines.Add(line.Trim());
+            }
         }
     }
 
@@ -1248,6 +1288,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     partial void OnSelectedDnsProviderChanged(string value)
     {
         OnPropertyChanged(nameof(IsCustomDoh));
+        // Keep the dropdown (bound to SelectedDnsProviderChoice) in sync when the provider changes
+        // from elsewhere (settings load, reset to defaults).
+        OnPropertyChanged(nameof(SelectedDnsProviderChoice));
     }
 
     partial void OnTorIpv6ModeChanged(string value)
@@ -2220,6 +2263,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             BlockUdpTraffic = true;
             HybridTorApps = string.Empty;
             HybridBypassApps = string.Empty;
+            BypassRoutingRules = string.Empty;
+            BlockRoutingRules = string.Empty;
 
             ThemeMode = ThemeModeSystem;
             UseNativeTheme = false;
@@ -2462,6 +2507,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             BlockUdpTraffic = BlockUdpTraffic,
             HybridTorApps = HybridTorApps,
             HybridBypassApps = HybridBypassApps,
+            BypassRoutingRules = BypassRoutingRules,
+            BlockRoutingRules = BlockRoutingRules,
             PersistentAdminHelperEnabled = PersistentAdminHelperEnabled
         };
     }
@@ -2726,6 +2773,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             BlockUdpTraffic = settings.BlockUdpTraffic ?? true;
             HybridTorApps = settings.HybridTorApps ?? string.Empty;
             HybridBypassApps = settings.HybridBypassApps ?? string.Empty;
+            BypassRoutingRules = settings.BypassRoutingRules ?? string.Empty;
+            BlockRoutingRules = settings.BlockRoutingRules ?? string.Empty;
             SelectedLanguage = NormalizeLanguageCode(settings.LanguageCode);
             LoadV3Settings(settings);
         }
@@ -2888,6 +2937,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             BlockUdpTraffic = BlockUdpTraffic,
             HybridTorApps = HybridTorApps,
             HybridBypassApps = HybridBypassApps,
+            BypassRoutingRules = BypassRoutingRules,
+            BlockRoutingRules = BlockRoutingRules,
             LanguageCode = SelectedLanguage
         };
 
