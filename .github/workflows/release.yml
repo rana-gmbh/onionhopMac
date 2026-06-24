@@ -105,34 +105,16 @@ jobs:
             -p:Version=${{ steps.version.outputs.version }} \
             -o build/x64
 
-      - name: Create universal binaries
-        run: |
-          rm -rf build/universal-full
-          mkdir -p build/universal-full
-          cp -R build/arm64/. build/universal-full/
+      # NOTE: there is deliberately no "universal" merge step. .NET self-contained publishes ship
+      # per-architecture managed assemblies (System.Private.CoreLib.dll is ReadyToRun/native-compiled
+      # for one arch), and those cannot be lipo'd. The old merge kept only the arm64 copies, so Intel
+      # Macs crashed at launch with 0x8007000B. Instead we build one DMG per architecture below, each
+      # using its own build/<arch> output. The shared native binaries (tor, lyrebird, conjure,
+      # sing-box, webtunnel/dnstt, the Swift helper) are universal, so they work in both DMGs.
 
-          while IFS= read -r -d '' x64file; do
-            rel="${x64file#build/x64/}"
-            arm64file="build/arm64/$rel"
-            outfile="build/universal-full/$rel"
-
-            mkdir -p "$(dirname "$outfile")"
-
-            if [ -f "$arm64file" ] && file "$arm64file" | grep -q "Mach-O" && file "$x64file" | grep -q "Mach-O"; then
-              arm64_archs="$(lipo -archs "$arm64file" 2>/dev/null || true)"
-              x64_archs="$(lipo -archs "$x64file" 2>/dev/null || true)"
-
-              if [ -n "$arm64_archs" ] && [ "$arm64_archs" != "$x64_archs" ]; then
-                lipo -create "$arm64file" "$x64file" -output "$outfile"
-              else
-                cp "$arm64file" "$outfile"
-              fi
-            elif [ ! -f "$outfile" ]; then
-              cp "$x64file" "$outfile"
-            fi
-          done < <(find build/x64 -type f -print0)
-
-      - name: Build macOS Swift helper
+      - name: Build macOS Swift helper (universal)
+        env:
+          MIN_MACOS_VERSION: ${{ env.MIN_MACOS_VERSION }}
         run: |
           # The Swift helper (onionhop-mac-helper) performs OnionHop's elevated macOS operations:
           # system proxy, /etc/resolver/onion DNS, pf kill switch, and NetworkExtension tunnel
@@ -177,68 +159,6 @@ jobs:
           file build/macos-vpn/sing-box
           lipo -archs build/macos-vpn/sing-box
 
-      - name: Create .app bundle
-        run: |
-          APP="publish/${{ env.APP_NAME }}.app"
-          mkdir -p "$APP/Contents/MacOS"
-          mkdir -p "$APP/Contents/Resources"
-
-          # Copy all published files into MacOS
-          cp -R build/universal-full/* "$APP/Contents/MacOS/"
-
-          # Bundle the Swift helper where MacSwiftHelper.ResolveHelperPath looks for it.
-          mkdir -p "$APP/Contents/MacOS/macos/OnionHopMacHelper"
-          cp macos/OnionHopMacHelper/onionhop-mac-helper "$APP/Contents/MacOS/macos/OnionHopMacHelper/onionhop-mac-helper"
-
-          # Bundle the macOS sing-box TUN core where the app looks: vpn/sing-box.
-          mkdir -p "$APP/Contents/MacOS/vpn"
-          cp build/macos-vpn/sing-box "$APP/Contents/MacOS/vpn/sing-box"
-
-          # Ensure native binaries are executable
-          chmod +x "$APP/Contents/MacOS/tor/tor" 2>/dev/null || true
-          chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/lyrebird" 2>/dev/null || true
-          chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/conjure-client" 2>/dev/null || true
-          chmod +x "$APP/Contents/MacOS/macos/OnionHopMacHelper/onionhop-mac-helper" 2>/dev/null || true
-          chmod +x "$APP/Contents/MacOS/vpn/sing-box" 2>/dev/null || true
-
-          # Copy icon if available
-          if [ -f ${{ env.APP_PROJECT }}/Assets/logo.png ]; then
-            cp ${{ env.APP_PROJECT }}/Assets/logo.png "$APP/Contents/Resources/AppIcon.png"
-          fi
-
-          # Create Info.plist
-          VERSION="${{ steps.version.outputs.version }}"
-          cat > "$APP/Contents/Info.plist" << PLIST
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key>
-            <string>${{ env.APP_NAME }}</string>
-            <key>CFBundleDisplayName</key>
-            <string>${{ env.APP_NAME }}</string>
-            <key>CFBundleIdentifier</key>
-            <string>${{ env.BUNDLE_ID }}</string>
-            <key>CFBundleVersion</key>
-            <string>${VERSION}</string>
-            <key>CFBundleShortVersionString</key>
-            <string>${VERSION}</string>
-            <key>CFBundleExecutable</key>
-            <string>OnionHopV3</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-            <key>CFBundleIconFile</key>
-            <string>AppIcon</string>
-            <key>LSMinimumSystemVersion</key>
-            <string>${{ env.MIN_MACOS_VERSION }}</string>
-            <key>NSHighResolutionCapable</key>
-            <true/>
-            <key>LSApplicationCategoryType</key>
-            <string>public.app-category.utilities</string>
-          </dict>
-          </plist>
-          PLIST
-
       - name: Import signing certificate
         env:
           CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
@@ -272,13 +192,19 @@ jobs:
           # Clean up
           rm /tmp/certificate.p12
 
-      - name: Sign application
+      - name: Build, sign & notarize per-architecture DMGs
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          APP="publish/${{ env.APP_NAME }}.app"
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
           IDENTITY="Developer ID Application: Rana GmbH (${{ secrets.APPLE_TEAM_ID }})"
-          ENTITLEMENTS_FILE=$(mktemp)
+          mkdir -p dist
 
-          # Create entitlements
+          # Shared, hardened-runtime entitlements applied to every signed Mach-O binary.
+          ENTITLEMENTS_FILE="$(mktemp)"
           cat > "$ENTITLEMENTS_FILE" << 'ENTITLEMENTS'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -300,73 +226,106 @@ jobs:
           </plist>
           ENTITLEMENTS
 
-          # Sign all Mach-O binaries and dylibs individually first
-          # (skip non-Mach-O files like .dll, .json, .txt)
-          find "$APP/Contents/MacOS" -type f \( -name "*.dylib" -o -name "*.so" \) | while read -r binary; do
-            codesign --force --options runtime --timestamp \
-              --sign "$IDENTITY" "$binary" 2>/dev/null || true
-          done
+          # Info.plist is identical for both architectures (same version + bundle id), so build it once.
+          PLIST_FILE="$(mktemp)"
+          cat > "$PLIST_FILE" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>${{ env.APP_NAME }}</string>
+            <key>CFBundleDisplayName</key>
+            <string>${{ env.APP_NAME }}</string>
+            <key>CFBundleIdentifier</key>
+            <string>${{ env.BUNDLE_ID }}</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>OnionHopV3</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>${{ env.MIN_MACOS_VERSION }}</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>LSApplicationCategoryType</key>
+            <string>public.app-category.utilities</string>
+          </dict>
+          </plist>
+          PLIST
 
-          # Sign native executables (Mach-O only) — skip managed .dll files
-          find "$APP/Contents/MacOS" -type f -perm +111 ! -name "*.dll" ! -name "*.json" ! -name "*.txt" ! -name "*.xml" ! -name "*.pdb" ! -name "*.config" | while read -r binary; do
-            if file "$binary" | grep -q "Mach-O"; then
-              codesign --force --options runtime --timestamp \
-                --entitlements "$ENTITLEMENTS_FILE" \
-                --sign "$IDENTITY" "$binary" 2>/dev/null || true
+          # Build one signed + notarized DMG per architecture. Each bundle uses its own build/<arch>
+          # publish output (correct managed assemblies + apphost + .NET dylibs for that CPU) plus the
+          # shared universal native binaries (Swift helper, sing-box, tor stack).
+          build_arch() {
+            ARCH="$1"          # arm64 (Apple Silicon) | x64 (Intel)
+            SRC="build/${ARCH}"
+            STAGE="publish/${ARCH}"
+            APP="${STAGE}/${{ env.APP_NAME }}.app"
+
+            rm -rf "$STAGE"
+            mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+            # Architecture-specific .NET payload.
+            cp -R "$SRC"/* "$APP/Contents/MacOS/"
+
+            # Universal Swift helper (elevated macOS ops; required for TUN/VPN mode).
+            mkdir -p "$APP/Contents/MacOS/macos/OnionHopMacHelper"
+            cp macos/OnionHopMacHelper/onionhop-mac-helper "$APP/Contents/MacOS/macos/OnionHopMacHelper/onionhop-mac-helper"
+
+            # Universal sing-box TUN core where the app looks: vpn/sing-box.
+            mkdir -p "$APP/Contents/MacOS/vpn"
+            cp build/macos-vpn/sing-box "$APP/Contents/MacOS/vpn/sing-box"
+
+            chmod +x "$APP/Contents/MacOS/tor/tor" 2>/dev/null || true
+            chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/lyrebird" 2>/dev/null || true
+            chmod +x "$APP/Contents/MacOS/tor/pluggable_transports/conjure-client" 2>/dev/null || true
+            chmod +x "$APP/Contents/MacOS/macos/OnionHopMacHelper/onionhop-mac-helper" 2>/dev/null || true
+            chmod +x "$APP/Contents/MacOS/vpn/sing-box" 2>/dev/null || true
+
+            if [ -f ${{ env.APP_PROJECT }}/Assets/logo.png ]; then
+              cp ${{ env.APP_PROJECT }}/Assets/logo.png "$APP/Contents/Resources/AppIcon.png"
             fi
-          done
+            cp "$PLIST_FILE" "$APP/Contents/Info.plist"
 
-          # Sign the .app bundle itself
-          codesign --force --deep --options runtime --timestamp \
-            --entitlements "$ENTITLEMENTS_FILE" \
-            --sign "$IDENTITY" "$APP"
+            # Sign dylibs/.so first, then native executables (Mach-O only, skip managed .dll), then the bundle.
+            find "$APP/Contents/MacOS" -type f \( -name "*.dylib" -o -name "*.so" \) | while read -r binary; do
+              codesign --force --options runtime --timestamp --sign "$IDENTITY" "$binary" 2>/dev/null || true
+            done
+            find "$APP/Contents/MacOS" -type f -perm +111 ! -name "*.dll" ! -name "*.json" ! -name "*.txt" ! -name "*.xml" ! -name "*.pdb" ! -name "*.config" | while read -r binary; do
+              if file "$binary" | grep -q "Mach-O"; then
+                codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS_FILE" --sign "$IDENTITY" "$binary" 2>/dev/null || true
+              fi
+            done
+            codesign --force --deep --options runtime --timestamp --entitlements "$ENTITLEMENTS_FILE" --sign "$IDENTITY" "$APP"
+            codesign --verify --deep --verbose=2 "$APP"
 
-          # Verify (without --strict to allow non-Mach-O resources)
-          codesign --verify --deep --verbose=2 "$APP"
+            # DMG with drag-to-Applications shortcut, signed + notarized + stapled.
+            ln -s /Applications "$STAGE/Applications"
+            DMG_NAME="${{ env.APP_NAME }}-${VERSION}-macOS-${ARCH}.dmg"
+            hdiutil create -volname "${{ env.APP_NAME }}" -srcfolder "$STAGE" -ov -format UDZO "dist/${DMG_NAME}"
+            codesign --force --timestamp --sign "$IDENTITY" "dist/${DMG_NAME}"
+            xcrun notarytool submit "dist/${DMG_NAME}" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait \
+              --timeout 30m
+            xcrun stapler staple "dist/${DMG_NAME}"
+            xcrun stapler validate "dist/${DMG_NAME}"
+            echo "Built and notarized dist/${DMG_NAME}"
+          }
 
-          rm "$ENTITLEMENTS_FILE"
+          build_arch arm64
+          build_arch x64
 
-      - name: Create DMG
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          DMG_NAME="${{ env.APP_NAME }}-${VERSION}-macOS.dmg"
-          mkdir -p dist
-
-          # Add Applications symlink so users can drag-to-install in one window
-          ln -s /Applications publish/Applications
-
-          # Create DMG with app + Applications shortcut side by side
-          hdiutil create -volname "${{ env.APP_NAME }}" \
-            -srcfolder publish \
-            -ov -format UDZO \
-            "dist/${DMG_NAME}"
-
-          # Sign DMG
-          IDENTITY="Developer ID Application: Rana GmbH (${{ secrets.APPLE_TEAM_ID }})"
-          codesign --force --timestamp --sign "$IDENTITY" "dist/${DMG_NAME}"
-
-          echo "DMG_PATH=dist/${DMG_NAME}" >> "$GITHUB_ENV"
-          echo "DMG_NAME=${DMG_NAME}" >> "$GITHUB_ENV"
-
-      - name: Notarize
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          # Submit for notarization
-          xcrun notarytool submit "${{ env.DMG_PATH }}" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait \
-            --timeout 30m
-
-          # Staple the notarization ticket to the DMG
-          xcrun stapler staple "${{ env.DMG_PATH }}"
-
-          # Verify stapling
-          xcrun stapler validate "${{ env.DMG_PATH }}"
+          rm -f "$ENTITLEMENTS_FILE" "$PLIST_FILE"
+          ls -lh dist
 
       - name: Clean up keychain
         if: always()
@@ -374,15 +333,15 @@ jobs:
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
 
-      - name: Upload DMG artifact
-        # Best-effort run artifact (handy for workflow_dispatch builds). Must not fail the job: the
-        # actual release attaches the DMG directly from disk in the next step. If the org's Actions
+      - name: Upload DMG artifacts
+        # Best-effort run artifacts (handy for workflow_dispatch builds). Must not fail the job: the
+        # actual release attaches the DMGs directly from disk in the next step. If the org's Actions
         # artifact-storage quota is hit, skip this and still publish the release.
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: OnionHop-macOS-dmg
-          path: ${{ env.DMG_PATH }}
+          name: OnionHop-macOS-dmgs
+          path: dist/*.dmg
           if-no-files-found: error
 
       - name: Create GitHub Release
@@ -398,8 +357,14 @@ jobs:
           body: |
             ## OnionHop ${{ steps.version.outputs.version }} for macOS
 
+            ### Which download do I need?
+            - **Apple Silicon (M1/M2/M3/M4):** `OnionHop-${{ steps.version.outputs.version }}-macOS-arm64.dmg`
+            - **Intel:** `OnionHop-${{ steps.version.outputs.version }}-macOS-x64.dmg`
+
+            Check Apple menu > About This Mac if you are unsure.
+
             ### Installation
-            1. Download the `.dmg` file below
+            1. Download the `.dmg` for your chip
             2. Open the DMG and drag OnionHop into the Applications folder
             3. Launch OnionHop from Applications
 
@@ -407,8 +372,8 @@ jobs:
             - Tor with pluggable transports (obfs4, snowflake, conjure, webtunnel)
             - Proxy mode and TUN/VPN mode support
             - GeoIP database for country-specific exit nodes
-            - Universal app bundle for Apple Silicon and Intel Macs
-          files: ${{ env.DMG_PATH }}
+            - Separate Apple Silicon (arm64) and Intel (x64) builds, each native to its CPU
+          files: dist/*.dmg
           draft: false
           prerelease: false
           make_latest: true
