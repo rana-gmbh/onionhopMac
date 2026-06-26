@@ -20,7 +20,10 @@ env:
   PUBLISH_DIR: publish/OnionHop.app
   APP_PROJECT: OnionHop/src/OnionHopV3.App
   EXE_NAME: OnionHopV3
-  MIN_MACOS_VERSION: '14.0'
+  # Minimum supported macOS. .NET 9 runs on Ventura, so target 13.0 to cover "legacy" Macs that
+  # can't move past Ventura (issue #62). Drives the deployment target, SupportedOSPlatformVersion,
+  # the universal Swift helper target, and LSMinimumSystemVersion (the gate macOS enforces).
+  MIN_MACOS_VERSION: '13.0'
 
 jobs:
   build-sign-release:
