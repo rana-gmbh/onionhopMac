@@ -1,0 +1,149 @@
+# Changelog
+
+## v3.5 (2026-07-02)
+
+Additions
+- Added a macOS CLI: CI now builds self-contained OnionHopCLI tarballs for Apple Silicon (arm64) and Intel (x64) Macs with a universal native runtime (tor, pluggable transports incl. webtunnel/dnstt, sing-box, xray, ArtiHop, snowflake proxy), matching the Linux CLI packaging.
+
+Fixes
+- Fixed the desktop window opening larger than the visible screen on Windows displays scaled above 100 percent, which pushed the title-bar buttons off screen with no way to move the window (#67). The window now clamps its size and minimum size to the current screen's work area and re-centers to stay fully reachable at any DPI.
+- Fixed Smart Connect aborting the whole connect as "Canceled" when a network probe merely timed out (#65). HTTP timeouts surface as cancellation exceptions in .NET; those are now treated as probe failures that fall back to the generic connection plan, so connect works on networks where the geolocation/OONI endpoints hang or are blocked.
+- Fixed a mistyped or unpublished geosite category (e.g. `ir`) making the sing-box start FATAL and taking down the whole TUN connection (#68). Remote geo rule-sets are now verified before the config is built: plain-name misses are automatically upgraded to SagerNet's `category-` variant when that exists (`ir` -> `category-ir`), and entries that cannot be found upstream are skipped with a warning in the log instead of breaking the start. Unknown country codes in country routing are handled the same way.
+- Fixed the Current Bridge tab in Logs squeezing bridge lines through the log-line parser, which sliced the transport name into the Time column (#69). The tab now has its own Type, Address and Details columns, and severity filters (which do not apply to bridges) are hidden there.
+
+## v3.4.5 (2026-06-30)
+
+Additions
+- Added country routing for TUN/VPN mode: keep whole countries direct (bypass Tor) or block them by IP, using auto-updating sing-box geoip rule-sets (#55).
+- Added domain-category routing for TUN/VPN mode: keep or block whole categories of domains (e.g. `category-ads-all`) using auto-updating sing-box geosite rule-sets (#55).
+
+Fixes
+- Fixed Conjure bridges by pointing the transport at `conjure-client` (with its registration URL) instead of `lyrebird`, which does not speak Conjure (#64).
+- Added an IPv6 kill switch (ip6tables) so IPv6 traffic is blocked alongside IPv4 in Proxy Mode.
+- Fixed Windows admin-helper status probing so persistent-helper connection validation cannot deadlock or hang indefinitely.
+- Fixed cancellation handling in dependency and bridge fetch paths.
+- Fixed custom vanilla bridge lines so they are not rewritten as a fake `custom` transport.
+- Fixed Arti/ArtiHop bridge transport arguments so Conjure and Snowflake launch with their required PT flags.
+- Fixed Linux/Windows DNS and Linux kill-switch setup to report failure when system rules are not actually installed.
+- Fixed relay, logs, bridge scanner, and custom DoH UI states.
+
+Packaging
+- CLI publish now includes optional ArtiHop and Snowflake runtime folders.
+- Release workflows run tests before packaging and upload checksum files with release assets.
+
+## v2.4.4 (2026-03-03)
+
+Additions
+- Added startup update checks when `Check for updates` is enabled.
+- Added a Home header update badge with direct link to the latest OnionHop release page.
+- Added EN/DE localization keys for update badge text and tooltip.
+
+Fixes
+- Fixed settings autosave threading (`Call from invalid thread`) by marshalling debounced saves back to Avalonia UI thread.
+- Improved update detection state handling so turning update checks off clears pending badge state immediately.
+
+Packaging
+- Bumped app/CLI/installer versioning to 2.4.4.
+- Release assets include GUI and CLI installers plus both portable bundles:
+- OnionHop-Setup-2.4.4.exe
+- OnionHop-CLI-Setup-2.4.4.exe
+- OnionHopV2-Portable-2.4.4-win-x64.zip
+- OnionHopCLI-Portable-2.4.4-win-x64.zip
+
+## v2.4.3 (2026-02-23)
+
+Additions
+- Added new TUN Engine section in Advanced settings (issue #31) with stack selection, optional MTU, and strict-route control.
+- Added localization keys (EN/DE) for the new TUN controls and stack labels.
+- Kept the Home card focused on routing controls only for a cleaner default layout.
+
+Fixes
+- Reworked HTTP proxy handling for LAN/local clients (issue #28): OnionHop now runs an internal HTTP proxy bridge over Tor SOCKS for better client compatibility.
+- HTTP proxy startup now logs explicit status and falls back to SOCKS-only mode if HTTP bridge startup fails.
+- Extended settings/connect-option persistence and VPN config generation to include TUN stack/MTU/strict-route options.
+- Added test coverage for TUN option parsing/serialization and VPN config output.
+
+Packaging
+- Bumped app/CLI/installer versioning to 2.4.3.
+- Release assets should include GUI + CLI installers and both portable bundles:
+- OnionHop-Setup-2.4.3.exe
+- OnionHop-CLI-Setup-2.4.3.exe
+- OnionHopV2-Portable-2.4.3-win-x64.zip
+- OnionHopCLI-Portable-2.4.3-win-x64.zip
+
+## v2.4.2 (2026-02-23)
+
+Additions
+- Added optional LAN proxy access for Tor SOCKS/HTTP listeners (advanced setting, disabled by default).
+- Added configurable connection timeout (advanced setting): auto by default, custom seconds, or disable with `0`.
+- Added grouping and collapsible sections in Advanced settings for better readability.
+- Added localization keys for new advanced controls and manual exit fingerprint labels.
+
+Fixes
+- Improved local/manual proxy hint messaging when LAN bind mode is enabled.
+- Wired Tor launch arguments to support explicit SOCKS/HTTP bind addresses.
+- Updated settings persistence and connect-option plumbing for LAN access + timeout controls.
+- Added/updated tests for timeout resolution and settings round-trip coverage.
+
+Packaging
+- Bumped app/CLI/installer versioning to 2.4.2.
+- Release assets include GUI and CLI installers plus portable bundles:
+- OnionHop-Setup-2.4.2.exe
+- OnionHop-CLI-Setup-2.4.2.exe
+- OnionHopV2-Portable-2.4.2-win-x64.zip
+- OnionHopCLI-Portable-2.4.2-win-x64.zip
+
+## v2.4.1 (2026-02-21)
+
+Additions
+- Added Update BridgeDB on Home to manually refresh bridge data after Tor is connected.
+- Added BridgeDB last-update timestamp display on Home.
+- Added Clear button in Logs with tab-aware behavior (App logs and DNS logs).
+
+Fixes
+- Improved BridgeDB refresh flow to force a fresh fetch (not stale runtime cache), with Tor-SOCKS routing when connected.
+- Improved Home action layout so secondary controls render correctly and the BridgeDB action has dedicated space.
+
+Packaging
+- Bumped app/CLI/installer versioning to 2.4.1.
+- Release assets include both GUI and CLI outputs so website latest-file lookup continues to work:
+- OnionHop-Setup-2.4.1.exe
+- OnionHop-CLI-Setup-2.4.1.exe
+- OnionHopV2-Portable-2.4.1-win-x64.zip
+- OnionHopCLI-Portable-2.4.1-win-x64.zip
+
+## v2.4 (2026-02-18)
+
+Additions
+- Added Smart Connect (enabled by default) in the Home view for one-click Tor setup.
+- Added country-aware Smart Connect planning that blends OONI Tor stats, recent OONI measurements, and optional CSV baselines.
+- Added automatic Smart Connect fallback sequencing (direct/bridge strategies) with retry-on-failure behavior.
+- Added OnionHop CLI (`OnionHopV2.Cli`) with interactive mode and command mode (`connect`, `disconnect`, `status`, `ip`, `newnym`, `plan`, `deps`).
+- Added CLI country-selection support via `--exit` / `--entry` and a `countries` command to list available country codes.
+- Added SOCKS-only system proxy scope for better browser and `.onion` compatibility.
+- Added connection elapsed timer display on the Home status card.
+- Added CLI installer with PATH integration and `onionhop` terminal launcher.
+- Added CLI portable packaging script (`installer/build-portable-cli.ps1`).
+- Added test coverage for `SmartConnectAdvisor`, `SingBoxLogProcessor`, and `TorLogHelper`.
+
+Fixes
+- Fixed connection flow to allow Smart Connect to safely override bridge/censorship settings per strategy when needed.
+- Fixed elevated-requirement handling so `.onion` DNS proxy no longer hard-fails Smart Connect attempts when admin rights are unavailable.
+- Fixed proxy behavior for SOCKS-only system mode by avoiding forced HTTP proxy assignment.
+- Fixed CLI `status` to refresh missing direct IP when disconnected, and improved status event output when only IP/port fields change.
+- Fixed CLI `ip` / `newnym` user feedback so commands always report a visible outcome (including unchanged IP or NEWNYM cooldown message).
+- Fixed IP refresh behavior while connected to Tor so failed Tor-exit lookups no longer silently fall back to direct-IP reporting.
+- Improved runtime diagnostics by extracting Tor and sing-box log processing into dedicated helpers and preserving recent status lines.
+- Improved cleanup diagnostics with explicit disposal error logging paths.
+
+Packaging
+- Bumped app/CLI/installer versioning to `2.4.0`.
+- Included both installers and both portable packages in the release asset set:
+- `OnionHop-Setup-2.4.0.exe`
+- `OnionHop-CLI-Setup-2.4.0.exe`
+- `OnionHopV2-Portable-2.4.0-win-x64.zip`
+- `OnionHopCLI-Portable-2.4.0-win-x64.zip`
+
+Notes
+- Sorry again for the previous release missing full installer/portable coverage.
+- Website/README content was improved with clearer CLI and packaging instructions.

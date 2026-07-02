@@ -366,6 +366,9 @@ jobs:
 
             Check Apple menu > About This Mac if you are unsure.
 
+            ### Command line
+            `OnionHopCLI-${{ steps.version.outputs.version }}-macos-arm64.tar.gz` / `…-macos-x64.tar.gz` — the terminal client, signed and notarized. Extract and run `./OnionHopV3.Cli`.
+
             ### Installation
             1. Download the `.dmg` for your chip
             2. Open the DMG and drag OnionHop into the Applications folder
@@ -380,3 +383,185 @@ jobs:
           draft: false
           prerelease: false
           make_latest: true
+
+  # ---------------------------------------------------------------------------
+  # macOS CLI: self-contained arm64 + x64 tarballs with the same universal native
+  # runtime as the Linux CLI (tor, transports, sing-box, xray, ArtiHop, snowflake
+  # proxy), built by download-deps-macos.sh. Every Mach-O binary is signed with the
+  # Developer ID certificate (hardened runtime) and the payload is notarized, so
+  # users do not have to strip the quarantine flag by hand. Runs in parallel with
+  # the DMG job; both attach their files to the same tag's release.
+  # ---------------------------------------------------------------------------
+  build-sign-cli:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(date +%Y.%m.%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build macOS native dependencies (universal)
+        run: |
+          chmod +x download-deps-macos.sh
+          bash download-deps-macos.sh
+
+      - name: Publish CLI (osx-arm64 + osx-x64, self-contained)
+        run: |
+          export MACOSX_DEPLOYMENT_TARGET="${{ env.MIN_MACOS_VERSION }}"
+          for RID in osx-arm64 osx-x64; do
+            dotnet publish OnionHop/src/OnionHopV3.Cli/OnionHopV3.Cli.csproj \
+              -c Release -r "$RID" --self-contained true \
+              /p:PublishSingleFile=false /p:PublishReadyToRun=false \
+              -p:SupportedOSPlatformVersion=${{ env.MIN_MACOS_VERSION }} \
+              -p:Version=${{ steps.version.outputs.version }} \
+              -o "publish-cli-$RID"
+          done
+
+      - name: Strip Windows-only artifacts + set exec bits
+        run: |
+          for RID in osx-arm64 osx-x64; do
+            DIR="publish-cli-$RID"
+            find "$DIR" -type f -name '*.exe' -delete || true
+            find "$DIR" -type f -name 'wintun.dll' -delete || true
+            chmod +x "$DIR/OnionHopV3.Cli" || true
+            for d in "$DIR/tor" "$DIR/tor/pluggable_transports" "$DIR/vpn" "$DIR/snowflake" "$DIR/artihop"; do
+              [ -d "$d" ] && chmod +x "$d"/* 2>/dev/null || true
+            done
+          done
+
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$CERTIFICATE_BASE64" | base64 --decode > /tmp/certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/cli-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import /tmp/certificate.p12 \
+            -P "$CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm /tmp/certificate.p12
+
+      - name: Sign, notarize & package tarballs
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          IDENTITY="Developer ID Application: Rana GmbH (${{ secrets.APPLE_TEAM_ID }})"
+          mkdir -p dist
+
+          # Same hardened-runtime entitlements the app bundle uses (the .NET runtime
+          # needs JIT + unsigned executable memory).
+          ENTITLEMENTS_FILE="$(mktemp)"
+          cat > "$ENTITLEMENTS_FILE" << 'ENTITLEMENTS'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+            <key>com.apple.security.cs.disable-library-validation</key>
+            <true/>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+            <true/>
+            <key>com.apple.security.network.client</key>
+            <true/>
+            <key>com.apple.security.network.server</key>
+            <true/>
+          </dict>
+          </plist>
+          ENTITLEMENTS
+
+          for ARCH in arm64 x64; do
+            DIR="publish-cli-osx-${ARCH}"
+
+            # Sign dylibs first, then every Mach-O executable (skip managed .dll payloads).
+            find "$DIR" -type f \( -name "*.dylib" -o -name "*.so" \) | while read -r binary; do
+              codesign --force --options runtime --timestamp --sign "$IDENTITY" "$binary" 2>/dev/null || true
+            done
+            find "$DIR" -type f ! -name "*.dll" ! -name "*.json" ! -name "*.txt" ! -name "*.xml" ! -name "*.pdb" ! -name "*.config" ! -name "*.dylib" ! -name "*.so" | while read -r binary; do
+              if file "$binary" | grep -q "Mach-O"; then
+                codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS_FILE" --sign "$IDENTITY" "$binary"
+              fi
+            done
+
+            # Notarize the signed payload (zip submission; Gatekeeper checks the
+            # notarization record online, tarballs cannot be stapled).
+            ditto -c -k --keepParent "$DIR" "dist/cli-${ARCH}-notarize.zip"
+            xcrun notarytool submit "dist/cli-${ARCH}-notarize.zip" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait \
+              --timeout 30m
+            rm "dist/cli-${ARCH}-notarize.zip"
+
+            NAME="OnionHopCLI-${VERSION}-macos-${ARCH}.tar.gz"
+            tar -C "$DIR" -czf "dist/$NAME" .
+            shasum -a 256 "dist/$NAME" | tee "dist/${NAME}.sha256.txt"
+          done
+
+          rm -f "$ENTITLEMENTS_FILE"
+          ls -lh dist
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/cli-signing.keychain-db
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+      - name: Upload CLI artifacts
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: OnionHopCLI-macos-signed
+          path: |
+            dist/OnionHopCLI-*-macos-*.tar.gz
+            dist/OnionHopCLI-*-macos-*.tar.gz.sha256.txt
+          if-no-files-found: error
+
+      - name: Attach CLI to release
+        # Files-only: the DMG job owns the release body/name; softprops merges
+        # assets into the same tag's release regardless of which job finishes first.
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('v{0}', steps.version.outputs.version) }}
+          files: |
+            dist/OnionHopCLI-*-macos-*.tar.gz
+            dist/OnionHopCLI-*-macos-*.tar.gz.sha256.txt
+          draft: false
+          prerelease: false

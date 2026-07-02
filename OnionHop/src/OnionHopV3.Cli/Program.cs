@@ -427,7 +427,7 @@ internal sealed class CliHost : IAsyncDisposable
             case "version":
             case "-v":
             case "--version":
-                WriteLine($"OnionHop CLI {ResolveVersion()}", ConsoleColor.White);
+                WriteLine($"OnionHop CLI {ResolveVersion()}  (build {ResolveBuildId()})", ConsoleColor.White);
                 return CommandResult.Success;
 
             case "quit":
@@ -470,7 +470,9 @@ internal sealed class CliHost : IAsyncDisposable
             {
                 plan = await _advisor.BuildPlanAsync(baseOptions, m => { if (_showLogs) WriteLog("smart", m, ConsoleColor.Blue); }, token);
             }
-            catch (OperationCanceledException) { throw; }
+            // Only a real Ctrl+C aborts; an HTTP-timeout TaskCanceledException from a probe must
+            // fall through to the generic plan, not print "Canceled." and give up (#65).
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 WriteWarning($"Smart Connect planning failed: {ex.Message}");
@@ -1325,6 +1327,24 @@ internal sealed class CliHost : IAsyncDisposable
             if (!string.IsNullOrWhiteSpace(core)) return core;
         }
         return assembly.GetName().Version?.ToString(3) ?? "3.0.0";
+    }
+
+    // The source-revision id baked into InformationalVersion (e.g. "3.1.1+f3d2174..."). Printed by the
+    // `version` command so two builds with the same version number can be told apart - exactly the
+    // "am I actually running the patched build?" confusion.
+    private static string ResolveBuildId()
+    {
+        var info = Assembly.GetExecutingAssembly()
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(info))
+        {
+            var parts = info.Split('+', 2, StringSplitOptions.TrimEntries);
+            if (parts.Length == 2 && !string.IsNullOrWhiteSpace(parts[1]))
+            {
+                return parts[1][..Math.Min(parts[1].Length, 10)];
+            }
+        }
+        return "local";
     }
 
     // ----- Lifecycle --------------------------------------------------------------------------
