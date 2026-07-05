@@ -47,6 +47,10 @@ public sealed partial class LogsPageViewModel : PageViewModelBase
     private HashSet<string> _connectedFingerprints = new(StringComparer.OrdinalIgnoreCase);
     private bool _bridgeStatusRefreshInProgress;
 
+    // Bridges tab sort state (#69): which column and direction the rows are ordered by.
+    [ObservableProperty] private string _bridgeSortColumn = "Type";
+    [ObservableProperty] private bool _bridgeSortDescending;
+
     public ObservableCollection<StructuredLogEntry> VisibleEntries { get; } = [];
 
     // The "Current Bridge" tab shows connection state, not a timestamped log stream, so it gets its
@@ -112,6 +116,54 @@ public sealed partial class LogsPageViewModel : PageViewModelBase
         return SelectedSource == SourceBridges
             ? string.Join(Environment.NewLine, BridgeRows.Select(row => row.RawLine))
             : string.Join(Environment.NewLine, VisibleEntries.Select(entry => entry.RawLine));
+    }
+
+    /// <summary>True while the bridges tab is selected, so the view can switch Copy/Export to the
+    /// bridge-specific formats (issue #56).</summary>
+    public bool IsBridgesExport => IsBridgesSelected;
+
+    /// <summary>
+    /// Copy text for the bridges tab (issue #56): only the bridge(s) Tor is actually using, so the
+    /// user gets the working bridge to carry to another device rather than the whole supplemented
+    /// list. Falls back to bridges seen in use this session, then to all rows when no live status is
+    /// available (e.g. the Arti engines expose none).
+    /// </summary>
+    public string GetBridgeCopyText()
+    {
+        var inUse = BridgeRows.Where(row => row.StatusTone == "success").ToList();
+        var seen = BridgeRows.Where(row => row.HasStatus).ToList();
+        var chosen = inUse.Count > 0 ? inUse : seen.Count > 0 ? seen : BridgeRows.ToList();
+        return string.Join(Environment.NewLine, chosen.Select(row => row.RawLine));
+    }
+
+    /// <summary>
+    /// CSV of the current bridges with status columns (issue #56): Type, Address, Status, Fingerprint
+    /// and the raw bridge line. Status is "In use", a last-seen time, or empty.
+    /// </summary>
+    public string GetBridgeCsv()
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("Type,Address,Status,Fingerprint,Bridge line\r\n");
+        foreach (var row in BridgeRows)
+        {
+            sb.Append(CsvField(row.Type)).Append(',')
+              .Append(CsvField(row.Address)).Append(',')
+              .Append(CsvField(row.StatusLabel)).Append(',')
+              .Append(CsvField(row.Fingerprint ?? string.Empty)).Append(',')
+              .Append(CsvField(row.RawLine)).Append("\r\n");
+        }
+
+        return sb.ToString();
+    }
+
+    private static string CsvField(string value)
+    {
+        if (value.IndexOfAny([',', '"', '\n', '\r']) < 0)
+        {
+            return value;
+        }
+
+        return "\"" + value.Replace("\"", "\"\"") + "\"";
     }
 
     public string GetSelectedFileNameStem()
@@ -445,7 +497,7 @@ public sealed partial class LogsPageViewModel : PageViewModelBase
 
     private void RebuildBridgeRows()
     {
-        BridgeRows.Clear();
+        var rows = new List<BridgeRowEntry>();
         foreach (var line in State.ActiveBridgeLines)
         {
             if (string.IsNullOrWhiteSpace(line))
@@ -479,12 +531,62 @@ public sealed partial class LogsPageViewModel : PageViewModelBase
             if (string.IsNullOrWhiteSpace(SearchText) ||
                 row.RawLine.Contains(SearchText, StringComparison.OrdinalIgnoreCase))
             {
-                BridgeRows.Add(row);
+                rows.Add(row);
             }
+        }
+
+        // In-use bridges always float to the top; the chosen column then orders the rest (#69).
+        var sorted = SortBridgeRows(rows);
+        BridgeRows.Clear();
+        foreach (var row in sorted)
+        {
+            BridgeRows.Add(row);
         }
 
         OnPropertyChanged(nameof(ShowEmptyState));
     }
+
+    private IEnumerable<BridgeRowEntry> SortBridgeRows(List<BridgeRowEntry> rows)
+    {
+        Func<BridgeRowEntry, string> key = BridgeSortColumn switch
+        {
+            "Address" => r => r.Address,
+            "Status" => r => r.StatusLabel,
+            _ => r => r.Type
+        };
+
+        var ordered = BridgeSortDescending
+            ? rows.OrderByDescending(key, StringComparer.OrdinalIgnoreCase)
+            : rows.OrderBy(key, StringComparer.OrdinalIgnoreCase);
+
+        // Keep the bridge actually in use pinned to the top regardless of sort, so it stays obvious.
+        return ordered.OrderByDescending(r => r.StatusTone == "success");
+    }
+
+    /// <summary>Sort the bridges tab by a column, toggling ascending/descending on repeat clicks (#69).</summary>
+    [RelayCommand]
+    private void SortBridges(string? column)
+    {
+        if (string.IsNullOrWhiteSpace(column))
+        {
+            return;
+        }
+
+        if (string.Equals(BridgeSortColumn, column, StringComparison.Ordinal))
+        {
+            BridgeSortDescending = !BridgeSortDescending;
+        }
+        else
+        {
+            BridgeSortColumn = column;
+            BridgeSortDescending = false;
+        }
+
+        RebuildBridgeRows();
+    }
+
+    /// <summary>Copy a single bridge row's raw line (#69: one-tap copy per row).</summary>
+    public string GetBridgeRowLine(BridgeRowEntry? row) => row?.RawLine ?? string.Empty;
 
     // A bridge line is "<transport> host:port fingerprint key=value ..." for pluggable transports,
     // or just "host:port fingerprint" for vanilla bridges (no transport token). Transport names never
