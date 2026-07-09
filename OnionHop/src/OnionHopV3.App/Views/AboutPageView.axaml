@@ -205,6 +205,21 @@
               <TextBlock Text="{DynamicResource About.FrontedDefaults}"
                          Classes="SectionCaption"
                          TextWrapping="Wrap" />
+              <TextBlock Text="{DynamicResource About.SniSources}"
+                         Classes="SectionCaption"
+                         TextWrapping="Wrap" />
+              <Button Classes="ActionGhost"
+                      HorizontalAlignment="Left"
+                      Tag="https://github.com/center2055/OnionHop-SNI-Lists"
+                      Click="OnOpenLinkClick">
+                <StackPanel Orientation="Horizontal"
+                            Spacing="8">
+                  <icons:MaterialIcon Kind="{x:Static mi:MaterialIconKind.Github}"
+                                      Width="18"
+                                      Height="18" />
+                  <TextBlock Text="OnionHop SNI Lists" />
+                </StackPanel>
+              </Button>
             </StackPanel>
           </Border>
         </StackPanel>
@@ -283,7 +298,15 @@
                               BorderThickness="1"
                               CornerRadius="8"
                               Padding="12">
-                        <controls:MarkdownTextBlock Markdown="{Binding Notes}" />
+                        <StackPanel Spacing="10">
+                          <controls:MarkdownTextBlock Markdown="{Binding Notes}" />
+                          <!-- Open this release's page on GitHub in the browser (issue: About release links). -->
+                          <Button Classes="ActionGhost"
+                                  HorizontalAlignment="Left"
+                                  Tag="{Binding ReleaseUrl}"
+                                  Click="OnOpenLinkClick"
+                                  Content="{DynamicResource About.ChangelogViewOnline}" />
+                        </StackPanel>
                       </Border>
                     </StackPanel>
                   </Border>
