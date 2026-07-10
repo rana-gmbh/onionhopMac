@@ -1,5 +1,10 @@
 # Changelog
 
+## v3.7.1 (2026-07-10)
+
+Additions
+- Saved-bridges library: each saved entry now has a "Copy" button next to Apply/Delete that copies just that bridge line or SNI host to the clipboard, so you can paste it into the bridge or SNI scanner and rescan it without having to apply it first.
+
 ## v3.7 (2026-07-09)
 
 Fixes
