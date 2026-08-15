@@ -3,6 +3,7 @@
              xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
              xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
              xmlns:controls="using:OnionHopV3.App.Controls"
+             xmlns:behaviors="using:OnionHopV3.App.Behaviors"
              xmlns:vm="using:OnionHopV3.App.ViewModels"
              xmlns:svc="using:OnionHopV3.Core.Services"
              mc:Ignorable="d"
@@ -72,7 +73,7 @@
             </StackPanel>
           </WrapPanel>
 
-          <TextBox AcceptsReturn="True" MinHeight="86" MaxHeight="160" TextWrapping="NoWrap" FontFamily="Consolas"
+          <TextBox AcceptsReturn="True" MinHeight="86" MaxHeight="160" TextWrapping="NoWrap" FontFamily="Consolas" behaviors:TextBoxEditMenu.IsEnabled="True"
                    Watermark="{DynamicResource Scanner.CustomWatermark}" Text="{Binding CustomBridges}" IsVisible="{Binding UseCustomBridges}" />
 
           <WrapPanel Orientation="Horizontal">
@@ -193,7 +194,7 @@
           <!-- Candidate domains: collapsed until Custom list is on, or a list is loaded/imported/requested. -->
           <StackPanel Spacing="4" IsVisible="{Binding ShowDomainBox}">
             <TextBlock Text="{DynamicResource Sni.Domains}" Classes="SectionCaption" />
-            <TextBox AcceptsReturn="True" MinHeight="64" MaxHeight="140" TextWrapping="NoWrap" FontFamily="Consolas"
+            <TextBox AcceptsReturn="True" MinHeight="64" MaxHeight="140" TextWrapping="NoWrap" FontFamily="Consolas" behaviors:TextBoxEditMenu.IsEnabled="True"
                      Watermark="{DynamicResource Sni.DomainsWatermark}" Text="{Binding DomainList}" />
           </StackPanel>
 
@@ -201,11 +202,11 @@
           <WrapPanel Orientation="Horizontal" IsVisible="{Binding IsRangeMode}">
             <StackPanel Spacing="4" Margin="0,0,16,8">
               <TextBlock Text="{DynamicResource Sni.RangeSni}" Classes="SectionCaption" />
-              <TextBox Width="240" FontFamily="Consolas" Watermark="cdn.example.com" Text="{Binding RangeSni}" />
+              <TextBox Width="240" FontFamily="Consolas" Watermark="cdn.example.com" Text="{Binding RangeSni}" behaviors:TextBoxEditMenu.IsEnabled="True" />
             </StackPanel>
             <StackPanel Spacing="4" Margin="0,0,16,8">
               <TextBlock Text="{DynamicResource Sni.RangeCidr}" Classes="SectionCaption" />
-              <TextBox Width="200" FontFamily="Consolas" Watermark="104.16.0.0/24" Text="{Binding RangeCidr}" />
+              <TextBox Width="200" FontFamily="Consolas" Watermark="104.16.0.0/24" Text="{Binding RangeCidr}" behaviors:TextBoxEditMenu.IsEnabled="True" />
             </StackPanel>
           </WrapPanel>
 

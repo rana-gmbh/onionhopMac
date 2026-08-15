@@ -81,6 +81,11 @@
   <x:String x:Key="Saved.Apply">Применить</x:String>
   <x:String x:Key="Saved.Delete">Удалить</x:String>
   <x:String x:Key="Saved.Copy">Копировать</x:String>
+  <x:String x:Key="Edit.Cut">Вырезать</x:String>
+  <x:String x:Key="Edit.Copy">Копировать</x:String>
+  <x:String x:Key="Edit.Paste">Вставить</x:String>
+  <x:String x:Key="Edit.Delete">Удалить</x:String>
+  <x:String x:Key="Edit.SelectAll">Выбрать все</x:String>
   <x:String x:Key="Saved.EmptyTitle">Пока ничего не сохранено</x:String>
   <x:String x:Key="Saved.EmptyDescription">Сохраняйте рабочие мосты или SNI-хосты из сканера, чтобы собрать библиотеку.</x:String>
 
@@ -271,6 +276,8 @@
   <x:String x:Key="Settings.TunMtuWatermark">Пусто = по умолчанию (авто)</x:String>
   <x:String x:Key="Settings.TunStrictRoute">Строгая маршрутизация</x:String>
   <x:String x:Key="Settings.TunStrictRouteHint">При включении маршруты должны оставаться в пути TUN. Отключайте только для устранения неполадок в сложных сетях.</x:String>
+  <x:String x:Key="Settings.TunDisableIpv6">Отключить IPv6 в туннеле</x:String>
+  <x:String x:Key="Settings.TunDisableIpv6Hint">Создаёт адаптер туннеля без адреса IPv6. Включите, если туннель не запускается с ошибкой "set ipv6 address". OnionHop и так повторяет попытку без IPv6; эта настройка пропускает неудачную попытку.</x:String>
   <x:String x:Key="Settings.AdvancedTrafficRulesSection">Ограничения трафика</x:String>
   <x:String x:Key="Settings.AdvancedManualExitSection">Ручное переопределение выхода</x:String>
   <x:String x:Key="Settings.EntryNode">Входной узел (необязательно)</x:String>

@@ -81,6 +81,11 @@
   <x:String x:Key="Saved.Apply">Apply</x:String>
   <x:String x:Key="Saved.Delete">Delete</x:String>
   <x:String x:Key="Saved.Copy">Copy</x:String>
+  <x:String x:Key="Edit.Cut">Cut</x:String>
+  <x:String x:Key="Edit.Copy">Copy</x:String>
+  <x:String x:Key="Edit.Paste">Paste</x:String>
+  <x:String x:Key="Edit.Delete">Delete</x:String>
+  <x:String x:Key="Edit.SelectAll">Select all</x:String>
   <x:String x:Key="Saved.EmptyTitle">Nothing saved yet</x:String>
   <x:String x:Key="Saved.EmptyDescription">Save working bridges or SNI hosts from the scanner to build your library.</x:String>
 
@@ -274,6 +279,8 @@
   <x:String x:Key="Settings.TunMtuWatermark">Empty = default (auto)</x:String>
   <x:String x:Key="Settings.TunStrictRoute">Strict route</x:String>
   <x:String x:Key="Settings.TunStrictRouteHint">When enabled, routes must stay in the TUN path. Disable only for troubleshooting difficult networks.</x:String>
+  <x:String x:Key="Settings.TunDisableIpv6">Disable IPv6 in the tunnel</x:String>
+  <x:String x:Key="Settings.TunDisableIpv6Hint">Builds the tunnel adapter without an IPv6 address. Turn this on if the tunnel fails to start with "set ipv6 address". OnionHop already retries without IPv6 on its own; this skips the failed attempt.</x:String>
   <x:String x:Key="Settings.AdvancedTrafficRulesSection">Traffic restrictions</x:String>
   <x:String x:Key="Settings.AdvancedManualExitSection">Manual exit override</x:String>
   <x:String x:Key="Settings.EntryNode">Entry node (optional)</x:String>
