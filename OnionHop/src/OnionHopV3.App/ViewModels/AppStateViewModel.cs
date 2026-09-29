@@ -305,9 +305,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             BridgeSourceCustom
         ];
 
-        RefreshLanguageOptions();
-        RefreshLocalizedOptions();
-
+        // Bridge types first: RefreshLocalizedOptions builds the Bridge type dropdown from this list, so
+        // filling it afterwards left that dropdown empty until a later startup step rebuilt it (and
+        // empty for good if that step never ran).
         BridgeTypes.Add(BridgeTypeAutomatic);
         BridgeTypes.Add(BridgeTypeVanilla);
         BridgeTypes.Add("obfs4");
@@ -317,6 +317,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         BridgeTypes.Add("webtunnel");
         BridgeTypes.Add("dnstt");
         BridgeTypes.Add("custom");
+
+        RefreshLanguageOptions();
+        RefreshLocalizedOptions();
 
         _settingsService = new SettingsService(Program.OverrideBaseDirectory);
         _client = new OnionHopClient(Program.OverrideBaseDirectory);
@@ -526,6 +529,10 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private string _statusMessage = string.Empty;
     [ObservableProperty] private string _sidebarStatusMessage = string.Empty;
     [ObservableProperty] private string _connectionStatus = string.Empty;
+    // Whether full-tunnel TUN mode is really carrying this computer's traffic (#83). Runtime only.
+    [ObservableProperty] private OnionHopClient.TunnelCheckState _tunnelCheck = OnionHopClient.TunnelCheckState.NotApplicable;
+    // The kill switch fired and is blocking all traffic until the user lifts it. Runtime only.
+    [ObservableProperty] private bool _killSwitchHolding;
     [ObservableProperty] private string _currentIp = "--.--.--.--";
     [ObservableProperty] private string _socksProxyPort = OnionHopClient.DefaultSocksPort.ToString();
     [ObservableProperty] private string _httpProxyPort = "--";
@@ -615,7 +622,10 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             return string.Format(
                 CultureInfo.CurrentCulture,
                 LocalizationService.Get("Home.BridgeDataLastUpdateValue"),
-                localTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.CurrentCulture));
+                // Invariant, not current: this is a fixed ISO pattern, and under a culture whose
+                // default calendar is not Gregorian (fa-IR) "yyyy" printed the Solar Hijri year, so an
+                // English UI showed "1405-04-19".
+                localTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
         }
     }
 
@@ -1441,6 +1451,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         {
             try
             {
+                // A kill switch block survives an app restart on purpose. Find it first, so the Home
+                // page can offer to lift it rather than connecting just failing behind it.
+                await _client.DetectKillSwitchLeftOnAsync().ConfigureAwait(false);
                 await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
                 await _client.RefreshIpAsync(updateStatusMessage: false, CancellationToken.None).ConfigureAwait(false);
             }
@@ -2164,6 +2177,15 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     }
 
     [RelayCommand]
+    private async Task ReleaseKillSwitchAsync()
+    {
+        if (await _client.ReleaseKillSwitchAsync())
+        {
+            await _client.RefreshIpAsync(updateStatusMessage: false, CancellationToken.None);
+        }
+    }
+
+    [RelayCommand]
     private async Task RefreshBridgeDataAsync()
     {
         if (_disposed || IsBridgeDataUpdateInProgress)
@@ -2564,6 +2586,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         StatusMessage = LocalizeRuntimeText(update.StatusMessage);
         ConnectionProgress = update.ConnectionProgress;
         CurrentIp = update.CurrentIp;
+        TunnelCheck = update.TunnelCheck;
+        KillSwitchHolding = update.KillSwitchHolding;
         SocksProxyPort = update.SocksPort.ToString();
         HttpProxyPort = update.HttpPort.HasValue ? update.HttpPort.Value.ToString() : "--";
         // While connected, mirror the live OS proxy state. While disconnected, keep the user's
@@ -2897,6 +2921,10 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             {
                 return;
             }
+
+            // Off the UI thread: this touches the registry and the WinINET refresh call, and the
+            // timer fires on the UI thread.
+            _ = Task.Run(() => _client.VerifySystemProxyStillApplied());
 
             try
             {

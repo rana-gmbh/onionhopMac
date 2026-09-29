@@ -49,7 +49,30 @@ public sealed class OnionHopClient : IDisposable
         double ConnectionProgress,
         string CurrentIp,
         int SocksPort,
-        int? HttpPort);
+        int? HttpPort,
+        TunnelCheckState TunnelCheck = TunnelCheckState.NotApplicable,
+        bool KillSwitchHolding = false);
+
+    /// <summary>
+    /// Whether the tunnel is actually carrying this computer's traffic. The displayed IP cannot tell:
+    /// it is fetched through Tor's SOCKS port, so it is a Tor exit whenever Tor runs, even if the
+    /// tunnel is capturing nothing at all. That is how a user could see "all traffic via Tor" next to
+    /// a Tor IP while their browser reported their real one (#83).
+    /// </summary>
+    public enum TunnelCheckState
+    {
+        /// <summary>Not in full-tunnel TUN mode, or not connected: nothing to check.</summary>
+        NotApplicable,
+
+        /// <summary>A new connection from this computer left through Tor.</summary>
+        Verified,
+
+        /// <summary>A new connection left with the IP this computer had before connecting.</summary>
+        Leaking,
+
+        /// <summary>No verdict: the lookup failed, or there is no pre-connect IP to compare with.</summary>
+        Unverifiable
+    }
 
     public readonly record struct DependencyUpdate(bool InProgress, string Status, double Progress);
     public readonly record struct BridgeDataRefreshStatus(
@@ -81,6 +104,20 @@ public sealed class OnionHopClient : IDisposable
 
     private readonly TorService _torService;
     private readonly OnionServiceStore _onionServiceStore = new();
+
+    // Tunnel check (#83). The last public IP seen while NOT connected is the baseline: if a fresh
+    // connection made after the tunnel is up still leaves with it, the tunnel is not carrying traffic.
+    private static readonly TimeSpan TunnelRecheckInterval = TimeSpan.FromSeconds(60);
+    private string? _lastKnownDirectIp;
+    private TunnelCheckState _tunnelCheck = TunnelCheckState.NotApplicable;
+    private DateTime _lastTunnelCheckUtc = DateTime.MinValue;
+    private int _tunnelCheckRunning;
+
+    // Set once the kill switch has fired: the connection died under a full-tunnel session and all
+    // outbound traffic is blocked. The block then stays up through the automatic teardown that
+    // follows, until the user restores internet or connects again. That teardown used to lift it a
+    // few seconds after it went up, which put traffic straight back on the real connection.
+    private volatile bool _killSwitchHolding;
     private readonly ArtiService _artiService;
     private readonly ArtiHopService _artiHopService;
     private readonly SnowflakeProxyService _snowflakeProxyService;
@@ -715,6 +752,21 @@ public sealed class OnionHopClient : IDisposable
             statusMessage: "Checking internet connectivity and preparing Tor...",
             progress: 0.02);
 
+        // A kill switch block stops everything, including the connectivity check below and Tor
+        // itself. Connecting again is the user's decision to end it, so lift it first.
+        if ((_killSwitchHolding || await Task.Run(() => _killSwitchService.IsEmergencyBlockActive()).ConfigureAwait(false))
+            && !await ReleaseKillSwitchAsync().ConfigureAwait(false))
+        {
+            SetStatus(
+                isConnecting: false,
+                isConnected: false,
+                isDisconnecting: false,
+                connectionStatus: "Disconnected",
+                statusMessage: "The kill switch is still blocking all traffic and could not be lifted, so OnionHop cannot connect.",
+                progress: 0);
+            return;
+        }
+
         StartupLogger.Write("OnionHopClient.ConnectAsync: Checking internet connectivity...");
         var connectivity = await InternetConnectivityProbe.CheckAsync(token).ConfigureAwait(false);
         if (connectivity.State == InternetConnectivityState.Offline)
@@ -1013,6 +1065,18 @@ public sealed class OnionHopClient : IDisposable
                     "direct resolve directly. For a single result with no direct traffic at all, turn Split Tunneling off " +
                     "and use full-tunnel TUN/VPN mode.");
             }
+            else if (IsTunMode(resolvedOptions) && OperatingSystem.IsWindows())
+            {
+                // The most likely explanation for #83: on Windows a connection keeps using the network
+                // interface that owns its source address, so anything a program opened BEFORE the tunnel
+                // came up stays outside it until it reconnects. Browsers keep connections to sites open
+                // for minutes, so reloading an IP-check page can show the real address while the tunnel
+                // is working perfectly for everything new.
+                RaiseLog(
+                    "Note: programs that were already online before the tunnel started can keep those existing connections " +
+                    "outside Tor until they reconnect. Browsers hold connections open for minutes, so restart your browser " +
+                    "after connecting to be sure every page goes through Tor.");
+            }
 
             if (!IsTunMode(resolvedOptions))
             {
@@ -1159,10 +1223,186 @@ public sealed class OnionHopClient : IDisposable
         await DisconnectCoreAsync(disableStatusUpdate: false).ConfigureAwait(false);
     }
 
+    /// <summary>True while a kill switch block is up and waiting for the user to lift it.</summary>
+    public bool IsKillSwitchHolding => _killSwitchHolding;
+
+    /// <summary>
+    /// Called when something the session depends on (the tunnel core, Tor, Arti) died underneath it,
+    /// before the automatic teardown. With the kill switch on in full-tunnel mode this blocks all
+    /// outbound traffic and keeps it blocked, since once the tunnel is gone everything would
+    /// otherwise go straight out on the real connection. Does nothing when the kill switch does not
+    /// apply or has already fired.
+    /// </summary>
+    private async Task TripKillSwitchIfEnabledAsync(string reason)
+    {
+        if (_killSwitchHolding || _isDisconnecting || !_isConnected || _activeOptions is not { } options
+            || !IsTunMode(options) || !options.KillSwitchEnabled || options.UseHybridRouting)
+        {
+            return;
+        }
+
+        // Set first, so a teardown racing this call cannot lift the block it is about to raise.
+        _killSwitchHolding = true;
+        try
+        {
+            if (PlatformHelper.IsAdministrator() || OperatingSystem.IsMacOS())
+            {
+                _killSwitchService.EnableEmergencyBlock(RaiseLog);
+            }
+            else if (OperatingSystem.IsWindows())
+            {
+                if (!await _adminHelper.EnsureConnectedAsync().ConfigureAwait(false)
+                    || !await _adminHelper.EnableKillSwitchAsync().ConfigureAwait(false))
+                {
+                    _killSwitchHolding = false;
+                    RaiseLog("Kill switch could not be enabled (admin helper unavailable).");
+                    return;
+                }
+            }
+            else
+            {
+                _killSwitchHolding = false;
+                RaiseLog("Kill switch could not be enabled: elevated privileges are required.");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _killSwitchHolding = false;
+            RaiseLog($"Kill switch could not be enabled: {ex.Message}");
+            return;
+        }
+
+        // Both ways of raising the block swallow their own errors, so confirm it is really there
+        // before Home claims traffic is blocked. macOS is skipped: reading pf rules needs root.
+        if (!OperatingSystem.IsMacOS() && !_killSwitchService.IsEmergencyBlockActive())
+        {
+            _killSwitchHolding = false;
+            RaiseLog($"Kill switch could not be enabled after {reason}: the firewall rule did not take. " +
+                     "Traffic is not blocked.");
+            return;
+        }
+
+        RaiseLog($"Kill switch engaged because {reason}. All internet traffic stays blocked until you " +
+                 "restore it on the Home page or connect again.");
+        PublishStatus();
+    }
+
+    /// <summary>
+    /// Lifts the kill switch block. Only the user decides this, by pressing "Restore internet" or by
+    /// connecting again; nothing automatic calls it. Returns false when the block is still up.
+    /// </summary>
+    public Task<bool> ReleaseKillSwitchAsync() =>
+        LiftKillSwitchAsync("Kill switch lifted.", "Kill switch lifted. Traffic is back to your normal connection.");
+
+    /// <summary>The tunnel came back by itself (the IPv6 retry), so its traffic is covered again.</summary>
+    private Task LiftKillSwitchAfterRecoveryAsync() => _killSwitchHolding
+        ? LiftKillSwitchAsync("The tunnel is back, so the kill switch block was lifted.", statusMessage: null)
+        : Task.CompletedTask;
+
+    private async Task<bool> LiftKillSwitchAsync(string logLine, string? statusMessage)
+    {
+        var holding = _killSwitchHolding;
+        var released = await Task.Run(async () =>
+        {
+            // A block this session raised is always taken down: detecting it needs root on macOS
+            // (pfctl), so "not detected" is only trusted for blocks nobody here knows about.
+            if (!holding && !_killSwitchService.IsEmergencyBlockActive())
+            {
+                return true;
+            }
+
+            if (PlatformHelper.IsAdministrator() || !OperatingSystem.IsWindows())
+            {
+                _killSwitchService.DisableEmergencyBlock(RaiseLog);
+            }
+            else
+            {
+                // The user asked for this, so starting the admin helper (a UAC prompt) is fine here.
+                await _adminHelper.DisableKillSwitchAsync().ConfigureAwait(false);
+            }
+
+            return !_killSwitchService.IsEmergencyBlockActive();
+        }).ConfigureAwait(false);
+
+        if (released)
+        {
+            _killSwitchHolding = false;
+            if (holding)
+            {
+                if (statusMessage != null)
+                {
+                    _statusMessage = statusMessage;
+                }
+
+                RaiseLog(logLine);
+            }
+        }
+        else
+        {
+            RaiseLog("The kill switch block could not be removed. Try again, or restart the computer: the block " +
+                     "is also cleared at the next system start.");
+        }
+
+        PublishStatus();
+        return released;
+    }
+
+    /// <summary>
+    /// A kill switch block outlives the app on purpose, so a restart can find one still up. Report it
+    /// as holding, so the Home page offers to restore internet instead of connecting just failing.
+    /// </summary>
+    public async Task DetectKillSwitchLeftOnAsync()
+    {
+        if (_killSwitchHolding || _isConnected || _isConnecting)
+        {
+            return;
+        }
+
+        var active = await Task.Run(() => _killSwitchService.IsEmergencyBlockActive()).ConfigureAwait(false);
+        if (active && !_killSwitchHolding && !_isConnected && !_isConnecting)
+        {
+            _killSwitchHolding = true;
+            RaiseLog("The kill switch from an earlier session is still blocking all internet traffic.");
+            PublishStatus();
+        }
+    }
+
     /// <summary>
     /// True when the system proxy is currently pointed at Tor.
     /// </summary>
     public bool IsSystemProxyEnabled => _proxyService.IsApplied;
+
+    /// <summary>
+    /// Proxy Mode protects traffic only while the OS proxy actually points at Tor, and that setting
+    /// can be reset underneath us by Windows, another VPN, a cleanup tool or a browser. Nothing
+    /// noticed, because "applied" was only ever our own in-memory flag: the toggle still read ON
+    /// while traffic left directly with the user's real IP, and the workaround people found was
+    /// turning the toggle off and on again (tester report). Called periodically while connected.
+    /// </summary>
+    public void VerifySystemProxyStillApplied()
+    {
+        if (!_isConnected || _isConnecting || _isDisconnecting)
+        {
+            return;
+        }
+
+        var options = _activeOptions;
+        if (options == null || IsTunMode(options) || !UsesSystemProxyScope(options) || !_proxyService.IsApplied)
+        {
+            return;
+        }
+
+        try
+        {
+            var httpPort = UsesSocksOnlySystemProxyScope(options) ? null : _activeHttpPort;
+            _proxyService.ReapplyIfLost(_activeSocksPort, httpPort, RaiseLog);
+        }
+        catch
+        {
+            // A watchdog must never be the thing that breaks a working session.
+        }
+    }
 
     /// <summary>
     /// True when the system proxy can be toggled independently of the Tor connection,
@@ -1456,8 +1696,189 @@ public sealed class OnionHopClient : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Full-tunnel TUN mode promises that everything leaves through Tor, but the IP shown on Home is
+    /// fetched through Tor's SOCKS port and so is a Tor exit no matter what the tunnel is doing. This
+    /// asks the question the user actually cares about: does a new connection from this computer,
+    /// made the way any browser would make one, come out through Tor? If it still comes out with the
+    /// address the machine had before connecting, the tunnel is not carrying traffic (#83).
+    ///
+    /// The app's own sockets are routed like every other program's on every platform (OnionHop is
+    /// deliberately not in the tunnel's direct list, and nothing excludes it by user id), which is
+    /// what makes a "leaking" verdict trustworthy.
+    /// </summary>
+    private async Task VerifyTunnelCarriesTrafficAsync(bool force)
+    {
+        var options = _activeOptions;
+        if (!_isConnected || options == null || !IsTunMode(options) || options.UseHybridRouting)
+        {
+            return;
+        }
+
+        if (!force && DateTime.UtcNow - _lastTunnelCheckUtc < TunnelRecheckInterval)
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _tunnelCheckRunning, 1) == 1)
+        {
+            return;
+        }
+
+        try
+        {
+            _lastTunnelCheckUtc = DateTime.UtcNow;
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(25));
+            var seen = await IpLookupService.TryFetchIpOverFreshConnectionAsync(RaiseLog, cts.Token).ConfigureAwait(false);
+            if (!_isConnected || _isDisconnecting)
+            {
+                return;
+            }
+
+            var verdict = TunnelCheckVerdict(_lastKnownDirectIp, seen);
+
+            // A bypass rule (site, IP range, country or category) sends some destinations direct on
+            // purpose, and the lookup service can be one of them: a country rule for the US covers
+            // most of these services. Coming back with the real IP is then expected, not a leak, so
+            // it must not raise the red "not protected" banner.
+            var explainedByRules = verdict == TunnelCheckState.Leaking && HasDirectRoutingRules(options);
+            if (explainedByRules)
+            {
+                verdict = TunnelCheckState.Unverifiable;
+            }
+
+            var changed = verdict != _tunnelCheck;
+            _tunnelCheck = verdict;
+
+            if (changed)
+            {
+                RaiseLog(verdict switch
+                {
+                    TunnelCheckState.Verified =>
+                        $"Tunnel check passed: a new connection from this computer left through Tor ({seen}).",
+                    TunnelCheckState.Leaking =>
+                        "WARNING: tunnel check FAILED. A new connection from this computer left with your real IP instead of " +
+                        "going through Tor, so your traffic is NOT protected even though Tor is running. Check the Sing-box or " +
+                        "Xray tab under Logs for routing errors. Do not rely on this connection for anything sensitive until this passes.",
+                    _ when explainedByRules =>
+                        "Tunnel check inconclusive: the test connection went out directly, but your routing rules send some " +
+                        "destinations direct on purpose and the test service may be one of them.",
+                    _ => _lastKnownDirectIp == null
+                        ? "Tunnel check skipped: OnionHop had not seen this computer's own IP before connecting, so there is nothing to compare against."
+                        : "Tunnel check could not complete (the lookup failed). It will retry."
+                });
+                PublishStatus();
+            }
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            RaiseLog($"Tunnel check failed to run: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _tunnelCheckRunning, 0);
+        }
+    }
+
+    /// <summary>
+    /// The verdict only claims "leaking" when a fresh connection came out with exactly the address
+    /// seen before connecting, which cannot happen if the tunnel carried it. Anything it cannot
+    /// compare fairly - no baseline, a failed lookup, or an IPv4 baseline against an IPv6 answer - is
+    /// reported as unverifiable rather than guessed, so the warning never fires on a technicality.
+    /// </summary>
+    internal static TunnelCheckState TunnelCheckVerdict(string? baselineIp, string? seenIp)
+    {
+        if (!IPAddress.TryParse(baselineIp?.Trim(), out var baseline)
+            || !IPAddress.TryParse(seenIp?.Trim(), out var seen))
+        {
+            return TunnelCheckState.Unverifiable;
+        }
+
+        if (baseline.AddressFamily != seen.AddressFamily)
+        {
+            return TunnelCheckState.Unverifiable;
+        }
+
+        return baseline.Equals(seen) ? TunnelCheckState.Leaking : TunnelCheckState.Verified;
+    }
+
+    /// <summary>True when the user has rules that send some traffic around Tor even in full tunnel.</summary>
+    internal static bool HasDirectRoutingRules(OnionHopConnectOptions options) =>
+        !string.IsNullOrWhiteSpace(options.BypassRoutingRules)
+        || !string.IsNullOrWhiteSpace(options.BypassCountries)
+        || !string.IsNullOrWhiteSpace(options.BypassSiteCategories);
+
+    private static readonly string? UserProfileDirectory = GetUserProfileDirectory();
+
+    private static string? GetUserProfileDirectory()
+    {
+        try
+        {
+            var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return string.IsNullOrWhiteSpace(profile) ? null : profile.TrimEnd('\\', '/');
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Replace the user's profile directory in a log line with a placeholder. Nearly every path OnionHop
+    /// logs lives under it (data directory, Tor, transports), and on most machines that directory is
+    /// named after the person: "C:\Users\Jane Doe\...". Those logs get pasted into public issues.
+    /// Paths are logged plain, JSON-escaped and with forward slashes, so all three spellings are covered.
+    /// </summary>
+    internal static string ScrubPersonalPaths(string message, string? profileDirectory)
+    {
+        if (string.IsNullOrEmpty(message) || string.IsNullOrEmpty(profileDirectory) || profileDirectory.Length < 4)
+        {
+            return message;
+        }
+
+        var placeholder = profileDirectory.Contains('\\') ? "%USERPROFILE%" : "~";
+        var escaped = profileDirectory.Replace("\\", "\\\\", StringComparison.Ordinal);
+        var forward = profileDirectory.Replace('\\', '/');
+
+        // Longest first, so the escaped spelling is not half-replaced by the plain one.
+        foreach (var spelling in new[] { escaped, profileDirectory, forward }.Distinct().OrderByDescending(s => s.Length))
+        {
+            message = message.Replace(spelling, placeholder, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return message;
+    }
+
+    /// <summary>
+    /// Users are asked to paste their logs into public GitHub issues, and the direct IP check used to
+    /// write their real address into them in full. Keep enough to tell networks apart when debugging
+    /// ("91.236.x.x"), drop the part that identifies the connection.
+    /// </summary>
+    internal static string MaskIpForLog(string? ip)
+    {
+        if (string.IsNullOrWhiteSpace(ip) || !IPAddress.TryParse(ip.Trim(), out var address))
+        {
+            return ip ?? string.Empty;
+        }
+
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            var octets = address.ToString().Split('.');
+            return $"{octets[0]}.{octets[1]}.x.x";
+        }
+
+        var groups = address.ToString().Split(':');
+        return groups.Length >= 2 ? $"{groups[0]}:{groups[1]}:x:x" : "x:x";
+    }
+
     public async Task RefreshIpAsync(bool updateStatusMessage, CancellationToken token)
     {
+        if (_killSwitchHolding && !_isConnected)
+        {
+            // Nothing gets out while the kill switch holds, so a lookup could only fail and log it.
+            return;
+        }
+
         var torFirst = _isConnected && IsTorRuntimeRunning;
         RaiseLog($"IP check: torFirst={torFirst}, isConnected={_isConnected}, runtime={_activeTorEngine}, runtimeRunning={IsTorRuntimeRunning}, socksPort={_activeSocksPort}");
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -1469,6 +1890,10 @@ public sealed class OnionHopClient : IDisposable
 
             if (torFirst)
             {
+                // The SOCKS lookup below only proves Tor works. Whether the rest of the machine goes
+                // through it is a separate question, re-asked here on its own schedule (#83).
+                _ = VerifyTunnelCarriesTrafficAsync(force: updateStatusMessage);
+
                 ip = await IpLookupService.TryFetchTorExitIpAsync(_activeSocksPort, RaiseLog, cts.Token).ConfigureAwait(false);
                 RaiseLog($"IP check via SOCKS: result='{ip}'");
                 if (!string.IsNullOrWhiteSpace(ip))
@@ -1495,9 +1920,16 @@ public sealed class OnionHopClient : IDisposable
             }
 
             ip = await IpLookupService.TryFetchDirectIpAsync(RaiseLog, cts.Token).ConfigureAwait(false);
-            RaiseLog($"IP check via DIRECT (not through Tor): result='{ip}'");
+            RaiseLog($"IP check via DIRECT (not through Tor): result='{MaskIpForLog(ip)}'");
             if (!string.IsNullOrWhiteSpace(ip))
             {
+                if (!_isConnected)
+                {
+                    // Only a lookup made while disconnected tells us the machine's own address, which
+                    // is what the tunnel check compares against.
+                    _lastKnownDirectIp = ip;
+                }
+
                 _currentIp = ip;
                 if (updateStatusMessage)
                 {
@@ -2160,7 +2592,9 @@ public sealed class OnionHopClient : IDisposable
                 _httpProxyBridgeService.Stop();
                 StopSingBoxProcess();
 
-                if (_killSwitchService.IsEmergencyBlockActive())
+                // A kill switch that has fired outlives this teardown on purpose (see
+                // _killSwitchHolding). Otherwise clear any block left over from an earlier session.
+                if (!_killSwitchHolding && _killSwitchService.IsEmergencyBlockActive())
                 {
                     if (PlatformHelper.IsAdministrator())
                     {
@@ -2207,6 +2641,9 @@ public sealed class OnionHopClient : IDisposable
             _activeOptions = null;
             _isConnected = false;
             _isDisconnecting = false;
+            // A new session gets a fresh verdict, checked as soon as it is up.
+            _tunnelCheck = TunnelCheckState.NotApplicable;
+            _lastTunnelCheckUtc = DateTime.MinValue;
             _connectionStatus = "Disconnected";
             _connectionProgress = 0;
             _activeSocksPort = DefaultSocksPort;
@@ -2221,13 +2658,16 @@ public sealed class OnionHopClient : IDisposable
 
             if (!disableStatusUpdate)
             {
-                _statusMessage = "Tor stopped. Traffic is back to normal.";
-                _currentIp = "Resolving...";
+                _statusMessage = _killSwitchHolding
+                    ? "The kill switch is blocking all internet traffic. Restore it on the Home page or connect again."
+                    : "Tor stopped. Traffic is back to normal.";
+                _currentIp = _killSwitchHolding ? "--.--.--.--" : "Resolving...";
             }
 
             PublishStatus();
 
-            if (!disableStatusUpdate)
+            // Nothing gets out while the kill switch holds, so an IP lookup could only fail.
+            if (!disableStatusUpdate && !_killSwitchHolding)
             {
                 _ = Task.Run(async () =>
                 {
@@ -2254,7 +2694,9 @@ public sealed class OnionHopClient : IDisposable
             ConnectionProgress: _connectionProgress,
             CurrentIp: _currentIp,
             SocksPort: _activeSocksPort,
-            HttpPort: _activeHttpPort));
+            HttpPort: _activeHttpPort,
+            TunnelCheck: _tunnelCheck,
+            KillSwitchHolding: _killSwitchHolding));
     }
 
     private void PublishDependency()
@@ -2394,17 +2836,17 @@ public sealed class OnionHopClient : IDisposable
 
     private void RaiseLog(string message)
     {
-        Log?.Invoke(this, message);
+        Log?.Invoke(this, ScrubPersonalPaths(message, UserProfileDirectory));
     }
 
     private void RaiseDnsLog(string message)
     {
-        DnsLog?.Invoke(this, message);
+        DnsLog?.Invoke(this, ScrubPersonalPaths(message, UserProfileDirectory));
     }
 
     private void RaiseVpnLog(string message)
     {
-        VpnLog?.Invoke(this, message);
+        VpnLog?.Invoke(this, ScrubPersonalPaths(message, UserProfileDirectory));
     }
 
     private async Task<OnionHopConnectOptions> StartTorWithBridgeFallbackAsync(OnionHopConnectOptions options, CancellationToken token)
@@ -3379,10 +3821,7 @@ public sealed class OnionHopClient : IDisposable
                         return;
                     }
 
-                    if (options.KillSwitchEnabled && !options.UseHybridRouting)
-                    {
-                        await _adminHelper.EnableKillSwitchAsync().ConfigureAwait(false);
-                    }
+                    await TripKillSwitchIfEnabledAsync("the tunnel stopped unexpectedly").ConfigureAwait(false);
 
                     // The tunnel only died because Windows refused the IPv6 address on the adapter.
                     // Rebuild it IPv4-only and carry on instead of tearing the connection down (#81):
@@ -3390,6 +3829,7 @@ public sealed class OnionHopClient : IDisposable
                     // making the user reconnect.
                     if (await TryRestartTunnelWithoutIpv6Async(options, token).ConfigureAwait(false))
                     {
+                        await LiftKillSwitchAfterRecoveryAsync().ConfigureAwait(false);
                         continue;
                     }
 
@@ -3482,6 +3922,7 @@ public sealed class OnionHopClient : IDisposable
             {
                 try
                 {
+                    await TripKillSwitchIfEnabledAsync("Tor stopped unexpectedly").ConfigureAwait(false);
                     _connectionStatus = "Tor stopped";
                     _statusMessage = $"Tor stopped unexpectedly (exit code {exitCode}). Disconnecting...";
                     _connectionProgress = 0;
@@ -3607,6 +4048,7 @@ public sealed class OnionHopClient : IDisposable
             {
                 try
                 {
+                    await TripKillSwitchIfEnabledAsync("Arti stopped unexpectedly").ConfigureAwait(false);
                     _connectionStatus = "Tor stopped";
                     _statusMessage = $"Arti stopped unexpectedly (exit code {exitCode}). Disconnecting...";
                     _connectionProgress = 0;
@@ -3664,6 +4106,7 @@ public sealed class OnionHopClient : IDisposable
             {
                 try
                 {
+                    await TripKillSwitchIfEnabledAsync("ArtiHop stopped unexpectedly").ConfigureAwait(false);
                     _connectionStatus = "Tor stopped";
                     _statusMessage = $"ArtiHop stopped unexpectedly (exit code {exitCode}). Disconnecting...";
                     _connectionProgress = 0;
@@ -3721,38 +4164,13 @@ public sealed class OnionHopClient : IDisposable
 
         RaiseLog($"{_activeVpnCoreMode} exited with code {exitCode}.");
 
-        if (_isConnected && _activeOptions is { } options && IsTunMode(options) && options.KillSwitchEnabled && !options.UseHybridRouting && !_isDisconnecting)
-        {
-            if (PlatformHelper.IsAdministrator())
-            {
-                _killSwitchService.EnableEmergencyBlock(RaiseLog);
-            }
-            else if (OperatingSystem.IsWindows())
-            {
-                _ = Task.Run(async () =>
-                {
-                    if (await _adminHelper.EnsureConnectedAsync().ConfigureAwait(false))
-                    {
-                        await _adminHelper.EnableKillSwitchAsync().ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        RaiseLog("Kill switch could not be enabled (admin helper unavailable).");
-                    }
-                });
-            }
-            else if (OperatingSystem.IsMacOS())
-            {
-                _killSwitchService.EnableEmergencyBlock(RaiseLog);
-            }
-            else
-            {
-                RaiseLog("Kill switch could not be enabled: elevated privileges are required.");
-            }
-        }
-
         if (_isConnected && !_isDisconnecting)
         {
+            // Started here rather than inside the task below: with administrator rights the block
+            // goes up synchronously, before this handler returns, which keeps the gap in which
+            // traffic can leave unprotected as short as possible.
+            var killSwitch = TripKillSwitchIfEnabledAsync("the tunnel stopped unexpectedly");
+
             var lastLines = string.Join("\n", _singBoxLogProcessor.GetRecentLines());
             if (!string.IsNullOrWhiteSpace(lastLines))
             {
@@ -3763,12 +4181,17 @@ public sealed class OnionHopClient : IDisposable
             {
                 try
                 {
+                    // Let the block finish going up (or fail) first, so the teardown below knows
+                    // whether there is a block to keep.
+                    await killSwitch.ConfigureAwait(false);
+
                     // Same IPv6 recovery as the helper-managed path: if the tunnel only died because
                     // Windows would not assign it an IPv6 address, rebuild it IPv4-only rather than
                     // dropping a connection whose Tor side is already up (#81).
                     if (_activeOptions is { } activeOptions
                         && await TryRestartTunnelWithoutIpv6Async(activeOptions, CancellationToken.None).ConfigureAwait(false))
                     {
+                        await LiftKillSwitchAfterRecoveryAsync().ConfigureAwait(false);
                         return;
                     }
 
