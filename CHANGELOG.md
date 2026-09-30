@@ -1,5 +1,17 @@
 # Changelog
 
+## v3.8.4 (2026-09-30)
+
+Fixes
+- **Linux: the window buttons no longer show as empty boxes.** Minimize, maximize and close were drawn with an icon font that only exists on Windows, so on Linux they came out as three "missing glyph" boxes (spotted in the AppImage catalog's screenshot). Outside Windows they are now drawn as vector icons; Windows keeps its native ones.
+- **The status on Home shrinks to fit instead of being cut off.** In a small window, or with a long translation, it read "Discon...".
+- **The Proxy Mode hints no longer mention Windows on Linux and macOS.** They now talk about the system proxy settings.
+- **Background lookups no longer take over Home's Latest line.** Refreshing the public relay list or looking up your IP fails harmlessly when you are offline, but it showed up in red as the headline event. It is still in Logs.
+- **The repository's LICENSE now holds the full GPL-3.0 text.** It only contained the short "version 3 or later" notice, so GitHub, and with it the AppImage catalog, could not tell which license OnionHop uses. The notice moved to the README.
+
+Additions
+- **The AppImage can update itself.** It now carries update information for AppImageUpdate and similar tools, with a `.zsync` file published next to it in each release, so an update only downloads the parts that changed. It is also built with the static AppImage runtime, so it no longer needs libfuse2 installed.
+
 ## v3.8.3 (2026-09-29)
 
 Fixes
