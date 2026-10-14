@@ -120,9 +120,18 @@ public sealed class SmartConnectAdvisor
                 Strategies: [customStrategy]);
         }
 
-        var publicIp = await IpLookupService.TryFetchDirectIpAsync(
+        // Every lookup here goes straight out over the user's own network, which in the countries
+        // that matter most often drops foreign hosts without an answer. One after another, each
+        // waiting out a 30s timeout, they could keep "analyzing the network" up for minutes before
+        // the first attempt. Side by side under one short budget, a dead lookup costs seconds.
+        using var lookupBudget = CancellationTokenSource.CreateLinkedTokenSource(token);
+        lookupBudget.CancelAfter(LookupBudget);
+        var ipLookup = IpLookupService.TryFetchDirectIpAsync(
             message => log?.Invoke($"Smart Connect: {message}"),
-            token).ConfigureAwait(false);
+            lookupBudget.Token);
+        var countryLookup = ResolveCountryCodeAsync(log, lookupBudget.Token);
+        var publicIp = await WithinBudgetAsync(ipLookup, token, null).ConfigureAwait(false);
+        var countryCode = await WithinBudgetAsync(countryLookup, token, null).ConfigureAwait(false);
 
         if (!string.IsNullOrWhiteSpace(publicIp))
         {
@@ -133,10 +142,17 @@ public sealed class SmartConnectAdvisor
             log?.Invoke("Smart Connect: direct IP could not be determined.");
         }
 
-        var countryCode = await ResolveCountryCodeAsync(publicIp, log, token).ConfigureAwait(false);
         if (!string.IsNullOrWhiteSpace(countryCode))
         {
             log?.Invoke($"Smart Connect: detected country {countryCode}.");
+            CountryGuess.Remember(countryCode);
+        }
+        else if (CountryGuess.TryGuess() is { } guess)
+        {
+            // Lookups blocked: "unknown" would mean trying direct Tor first, the one thing that does
+            // not work where lookups get blocked. Go by what this computer says instead.
+            countryCode = guess.Country;
+            log?.Invoke($"Smart Connect: country lookups failed; going by {guess.Basis}: {countryCode}.");
         }
         else
         {
@@ -148,8 +164,12 @@ public sealed class SmartConnectAdvisor
         BaselineSummary? csvBaseline = null;
         if (!string.IsNullOrWhiteSpace(countryCode))
         {
-            stats = await TryFetchTorStatsAsync(countryCode!, log, token).ConfigureAwait(false);
-            recentMeasurements = await TryFetchRecentMeasurementsSummaryAsync(countryCode!, log, token).ConfigureAwait(false);
+            using var signalBudget = CancellationTokenSource.CreateLinkedTokenSource(token);
+            signalBudget.CancelAfter(LookupBudget);
+            var statsLookup = TryFetchTorStatsAsync(countryCode!, log, signalBudget.Token);
+            var measurementsLookup = TryFetchRecentMeasurementsSummaryAsync(countryCode!, log, signalBudget.Token);
+            stats = await WithinBudgetAsync(statsLookup, token, null).ConfigureAwait(false);
+            recentMeasurements = await WithinBudgetAsync(measurementsLookup, token, null).ConfigureAwait(false);
             csvBaseline = await TryLoadCsvBaselineSummaryAsync(countryCode!, log, token).ConfigureAwait(false);
         }
 
@@ -211,8 +231,39 @@ public sealed class SmartConnectAdvisor
             log?.Invoke($"Smart Connect: country {countryCode} censorship prior raised risk {liveRisk} -> {risk} (offline profile).");
         }
 
-        var preferredTransports = CensorshipProfiles.GetPreferredTransports(countryCode);
-        var strategies = BuildStrategiesForRisk(baseOptions, risk, preferredTransports);
+        // Tor's own recommendations for this country, the data behind Tor Browser's Connection
+        // Assist: which transports to try in which order, and for some of them the exact bridge lines
+        // that work there. Where Tor has them, they beat our own table. Tor only curates countries
+        // that block it, so having any also means direct Tor is not the plan.
+        var circumvention = CircumventionSettings.Current;
+        var torSettings = circumvention.ForCountry(countryCode);
+        IReadOnlyList<string> preferredTransports;
+        var countryBridgeLines = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        if (torSettings.Count > 0)
+        {
+            preferredTransports = torSettings.Select(setting => setting.Transport).ToList();
+            foreach (var setting in torSettings.Where(setting => setting.BridgeLines.Count > 0))
+            {
+                countryBridgeLines[setting.Transport] = setting.BridgeLines;
+            }
+
+            log?.Invoke($"Smart Connect: following Tor's recommendations for {countryCode}: {string.Join(" -> ", preferredTransports)} ({circumvention.Source}).");
+            if (risk < RiskLevel.Moderate)
+            {
+                log?.Invoke($"Smart Connect: Tor lists {countryCode} as censored; raising risk {risk} -> {RiskLevel.Moderate}.");
+                risk = RiskLevel.Moderate;
+            }
+        }
+        else
+        {
+            preferredTransports = CensorshipProfiles.GetPreferredTransports(countryCode);
+        }
+
+        var strategies = BuildStrategiesForRisk(
+            baseOptions with { CensorshipCountryCode = countryCode },
+            risk,
+            preferredTransports,
+            countryBridgeLines);
 
         if (stats.HasValue)
         {
@@ -389,13 +440,28 @@ public sealed class SmartConnectAdvisor
         OnionHopConnectOptions baseOptions,
         RiskLevel risk,
         IReadOnlyList<string> preferredTransports)
+        => BuildStrategiesForRisk(baseOptions, risk, preferredTransports, new Dictionary<string, IReadOnlyList<string>>());
+
+    /// <param name="countryBridgeLines">
+    /// Bridge lines Tor recommends per transport for the user's country (Tor's circumvention
+    /// settings); a strategy for such a transport uses exactly these.
+    /// </param>
+    public static IReadOnlyList<Strategy> BuildStrategiesForRisk(
+        OnionHopConnectOptions baseOptions,
+        RiskLevel risk,
+        IReadOnlyList<string> preferredTransports,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> countryBridgeLines)
     {
         var strategies = new List<Strategy>();
 
-        // A country's preferred transports (from the offline profile) lead the bridge ladder, then
-        // the risk-tier defaults fill in anything not already covered. Deduplicated downstream.
+        // A country's preferred transports (Tor's recommendations, else our offline profile) lead
+        // the bridge ladder, then the risk-tier defaults fill in anything not already covered.
+        // Deduplicated downstream.
         IEnumerable<string> BridgeLadder(IReadOnlyList<string> tierDefaults)
             => (preferredTransports ?? Array.Empty<string>()).Concat(tierDefaults);
+
+        void AddBridgeLadder(IEnumerable<string> transports, string reasonPrefix)
+            => SmartConnectAdvisor.AddBridgeLadder(strategies, baseOptions, transports, reasonPrefix, countryBridgeLines);
 
         switch (risk)
         {
@@ -406,25 +472,27 @@ public sealed class SmartConnectAdvisor
                 // bridges when direct works?" surprise we want to avoid.
                 AddDirect(strategies, baseOptions, "Open network profile. Try direct Tor first.", DirectPrimaryAttemptTimeoutSeconds);
                 AddBridge(strategies, baseOptions, AutomaticBridgeType, "Fallback: automatic bridges.");
-                AddBridgeLadder(strategies, baseOptions, BridgeLadder(OpenLadder), "Fallback");
+                AddBridgeLadder(BridgeLadder(OpenLadder), "Fallback");
                 break;
 
             case RiskLevel.Moderate:
                 // Try direct briefly, but bridges are the real plan here.
                 AddDirect(strategies, baseOptions, "Moderately restricted profile. Try a brief direct attempt.");
-                AddBridgeLadder(strategies, baseOptions, BridgeLadder(ModerateLadder), "Bridge");
+                AddBridgeLadder(BridgeLadder(ModerateLadder), "Bridge");
                 break;
 
             case RiskLevel.Restricted:
                 // No direct first - Tor is commonly blocked here. Bridges lead; direct is a last resort.
-                AddBridgeLadder(strategies, baseOptions, BridgeLadder(RestrictedLadder), "Restricted profile bridge");
+                AddBridgeLadder(BridgeLadder(RestrictedLadder), "Restricted profile bridge");
                 AddDirect(strategies, baseOptions, "Last fallback: direct Tor.");
                 break;
 
             case RiskLevel.Severe:
-                // Aggressive, modern ladder. Snowflake with AMP fronting first, ending in dnstt
-                // (works where only DNS gets through). Direct only as an absolute last resort.
-                AddBridgeLadder(strategies, baseOptions, BridgeLadder(SevereLadder), "Heavily restricted profile bridge", forceSnowflakeAmp: true);
+                // Aggressive, modern ladder ending in dnstt (works where only DNS gets through).
+                // Direct only as an absolute last resort. Snowflake is not forced onto the AMP cache:
+                // that rendezvous needs a Google front, which China blocks, and the countries Tor
+                // curates get Tor's own Snowflake lines for them instead.
+                AddBridgeLadder(BridgeLadder(SevereLadder), "Heavily restricted profile bridge");
                 AddDirect(strategies, baseOptions, "Last fallback: direct Tor.");
                 break;
 
@@ -433,7 +501,7 @@ public sealed class SmartConnectAdvisor
                 // it the same full bootstrap budget as Open before falling back to bridges.
                 AddDirect(strategies, baseOptions, "Unknown network profile. Start direct.", DirectPrimaryAttemptTimeoutSeconds);
                 AddBridge(strategies, baseOptions, AutomaticBridgeType, "Fallback: automatic bridges.");
-                AddBridgeLadder(strategies, baseOptions, BridgeLadder(["obfs4", "snowflake"]), "Fallback");
+                AddBridgeLadder(BridgeLadder(["obfs4", "snowflake"]), "Fallback");
                 break;
         }
 
@@ -445,7 +513,7 @@ public sealed class SmartConnectAdvisor
         OnionHopConnectOptions baseOptions,
         IEnumerable<string> transports,
         string reasonPrefix,
-        bool forceSnowflakeAmp = false)
+        IReadOnlyDictionary<string, IReadOnlyList<string>> countryBridgeLines)
     {
         foreach (var transport in transports)
         {
@@ -457,7 +525,13 @@ public sealed class SmartConnectAdvisor
             var label = string.Equals(transport, AutomaticBridgeType, StringComparison.OrdinalIgnoreCase)
                 ? "automatic bridges"
                 : $"{transport} bridge";
-            AddBridge(target, baseOptions, transport, $"{reasonPrefix}: {label}.", forceSnowflakeAmp);
+            countryBridgeLines.TryGetValue(transport.Trim(), out var lines);
+            if (lines is { Count: > 0 })
+            {
+                label += " (Tor's lines for this country)";
+            }
+
+            AddBridge(target, baseOptions, transport, $"{reasonPrefix}: {label}.", lines);
         }
     }
 
@@ -499,13 +573,9 @@ public sealed class SmartConnectAdvisor
         OnionHopConnectOptions baseOptions,
         string bridgeType,
         string reason,
-        bool forceSnowflakeAmp = false)
+        IReadOnlyList<string>? countryBridgeLines = null)
     {
         var normalizedBridgeType = string.IsNullOrWhiteSpace(bridgeType) ? AutomaticBridgeType : bridgeType.Trim().ToLowerInvariant();
-        var shouldApplySnowflakeAmp = normalizedBridgeType == "snowflake" || normalizedBridgeType == AutomaticBridgeType;
-        var useSnowflakeAmp = shouldApplySnowflakeAmp
-            ? (baseOptions.UseSnowflakeAmp || forceSnowflakeAmp)
-            : baseOptions.UseSnowflakeAmp;
 
         target.Add(new Strategy(
             Name: $"bridge:{normalizedBridgeType}",
@@ -518,9 +588,9 @@ public sealed class SmartConnectAdvisor
                 BridgeSourceMode = OnionHopConnectOptions.BridgeSourceAuto,
                 CustomBridges = null,
                 CustomSniHosts = null,
+                CountryBridgeLines = countryBridgeLines is { Count: > 0 } ? string.Join("\n", countryBridgeLines) : null,
                 SelectedEntryLocation = OnionHopConnectOptions.AutomaticLocationLabel,
                 ExitNodeFingerprint = null,
-                UseSnowflakeAmp = useSnowflakeAmp,
                 SmartConnectAttemptTimeoutSeconds = BridgeAttemptTimeoutSeconds
             }));
     }
@@ -572,11 +642,33 @@ public sealed class SmartConnectAdvisor
     }
 
     /// <summary>
-    /// Reorder bridge strategies by measured reachability: transports with reachable bridges (more =
-    /// better, faster = better) lead, transports proven to have zero reachable bridges sink to the
-    /// back. Transports not in <paramref name="reachabilityByTransport"/> (e.g. fronted snowflake/
-    /// dnstt that can't be pre-probed, or the "automatic" meta-type) keep their relative order in the
-    /// middle. Non-bridge strategies (direct) keep their original position. Pure and order-stable.
+    /// Move the strategies whose transport failed on this network recently to the back, keeping the
+    /// order within both groups. They stay in the plan: censors move, and one of them may still be
+    /// the only thing that works.
+    /// </summary>
+    public static IReadOnlyList<Strategy> DemoteRecentlyFailed(
+        IReadOnlyList<Strategy> strategies,
+        IReadOnlySet<string> failedTransports)
+    {
+        if (strategies.Count < 2 || failedTransports.Count == 0)
+        {
+            return strategies;
+        }
+
+        return strategies
+            .Where(strategy => !failedTransports.Contains(GetStrategyTransport(strategy)))
+            .Concat(strategies.Where(strategy => failedTransports.Contains(GetStrategyTransport(strategy))))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Move the bridge strategies whose transport was measured unreachable here to the back; all
+    /// others keep the plan's order. Reachable transports are deliberately not re-ranked by how
+    /// many bridges answered or how fast: a probe sees obfs4 bridges that answer a TCP connect but
+    /// are cut off by DPI right after, and Snowflake's few fronts next to dozens of obfs4 bridges,
+    /// so counts compare nothing. The plan's order comes from Tor's field data for the country or
+    /// our profile; the probe's job is to skip what certainly fails. Non-bridge strategies (direct)
+    /// and unmeasured transports keep their place. Pure and order-stable.
     /// </summary>
     public static IReadOnlyList<Strategy> ReorderByReachability(
         IReadOnlyList<Strategy> strategies,
@@ -587,39 +679,14 @@ public sealed class SmartConnectAdvisor
             return strategies;
         }
 
-        // Stable rank: lower sorts earlier.
-        //   probed + has reachable bridges -> 0 (fastest/most first)
-        //   not probed (unknown)           -> 1 (keep middle)
-        //   probed + zero reachable        -> 2 (sink)
-        double RankOf(Strategy strategy)
-        {
-            if (!strategy.Options.UseTorBridges)
-            {
-                return 1d; // direct/manual: leave where it is among the unknowns
-            }
-
-            var transport = GetStrategyTransport(strategy);
-            if (!reachabilityByTransport.TryGetValue(transport, out var reach))
-            {
-                return 1d; // unknown / not pre-probed
-            }
-
-            if (reach.ReachableCount <= 0)
-            {
-                return 2d; // proven dead here
-            }
-
-            // Best when many bridges and low ping. Map into (0,1) so it always sorts before unknowns.
-            var pingPenalty = Math.Clamp((reach.FastestPingMs ?? 1000) / 10000d, 0d, 0.9d);
-            var countBonus = Math.Clamp(reach.ReachableCount / 100d, 0d, 0.9d);
-            return Math.Clamp(0.5d + pingPenalty - countBonus, 0.001d, 0.999d);
-        }
+        bool ProvenDead(Strategy strategy) =>
+            strategy.Options.UseTorBridges &&
+            reachabilityByTransport.TryGetValue(GetStrategyTransport(strategy), out var reach) &&
+            reach.ReachableCount <= 0;
 
         return strategies
-            .Select((strategy, index) => (strategy, index, rank: RankOf(strategy)))
-            .OrderBy(t => t.rank)
-            .ThenBy(t => t.index) // stable within the same rank band
-            .Select(t => t.strategy)
+            .Where(strategy => !ProvenDead(strategy))
+            .Concat(strategies.Where(ProvenDead))
             .ToList();
     }
 
@@ -668,52 +735,60 @@ public sealed class SmartConnectAdvisor
             options.OnionDnsProxyEnabled ? "dnsproxy:1" : "dnsproxy:0");
     }
 
-    private static async Task<string?> ResolveCountryCodeAsync(string? publicIp, Action<string>? log, CancellationToken token)
+    // Total time for the IP and country lookups, and again for the OONI lookups. Each answers in
+    // well under a second where it is reachable.
+    private static readonly TimeSpan LookupBudget = TimeSpan.FromSeconds(8);
+
+    // A lookup cut off by its budget is just "no answer"; only the user's own cancel aborts.
+    private static async Task<T> WithinBudgetAsync<T>(Task<T> lookup, CancellationToken userToken, T noAnswer)
     {
-        string? countryCode = null;
         try
         {
-            countryCode = await TryFetchCountryCodeFromOoniGeoLookupAsync(publicIp, token).ConfigureAwait(false);
+            return await lookup.ConfigureAwait(false);
         }
-        // Only user/system cancellation propagates. HttpClient timeouts throw TaskCanceledException
-        // (an OperationCanceledException) too - on hostile networks those must degrade to the
-        // fallback path below, not abort the whole connect as if the user pressed cancel (#65).
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        catch (OperationCanceledException) when (!userToken.IsCancellationRequested)
         {
-            throw;
+            return noAnswer;
         }
-        catch (Exception ex)
-        {
-            log?.Invoke($"Smart Connect: OONI geolookup failed: {ex.Message}");
-        }
+    }
 
-        if (!string.IsNullOrWhiteSpace(countryCode))
+    // Both services report the country of the address the request comes from, so they need no IP
+    // lookup first and run side by side; the first answer wins.
+    private static async Task<string?> ResolveCountryCodeAsync(Action<string>? log, CancellationToken token)
+    {
+        using var race = CancellationTokenSource.CreateLinkedTokenSource(token);
+        var pending = new List<(string Source, Task<string?> Lookup)>
         {
-            log?.Invoke("Smart Connect: country resolved from OONI geolookup.");
-            return countryCode;
-        }
+            ("OONI geolookup", TryFetchCountryCodeFromOoniGeoLookupAsync(null, race.Token)),
+            ("ipwho.is", TryFetchCountryCodeFromIpWhoIsAsync(null, race.Token))
+        };
 
-        try
+        while (pending.Count > 0)
         {
-            countryCode = await TryFetchCountryCodeFromIpWhoIsAsync(publicIp, token).ConfigureAwait(false);
-        }
-        // Only user/system cancellation propagates. HttpClient timeouts throw TaskCanceledException
-        // (an OperationCanceledException) too - on hostile networks those must degrade to the
-        // fallback path below, not abort the whole connect as if the user pressed cancel (#65).
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            log?.Invoke($"Smart Connect: ipwho.is lookup failed: {ex.Message}");
-            countryCode = null;
-        }
-
-        if (!string.IsNullOrWhiteSpace(countryCode))
-        {
-            log?.Invoke("Smart Connect: country resolved from ipwho.is.");
-            return countryCode;
+            var finished = await Task.WhenAny(pending.Select(entry => entry.Lookup)).ConfigureAwait(false);
+            var entry = pending.First(candidate => candidate.Lookup == finished);
+            pending.Remove(entry);
+            try
+            {
+                var countryCode = await finished.ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(countryCode))
+                {
+                    log?.Invoke($"Smart Connect: country resolved from {entry.Source}.");
+                    race.Cancel();
+                    return countryCode;
+                }
+            }
+            // Only user/system cancellation propagates. HttpClient timeouts throw TaskCanceledException
+            // (an OperationCanceledException) too - on hostile networks those must degrade to the
+            // other lookup, not abort the whole connect as if the user pressed cancel (#65).
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"Smart Connect: {entry.Source} failed: {ex.Message}");
+            }
         }
 
         return null;

@@ -1,5 +1,25 @@
 # Changelog
 
+## v3.9 (2026-10-14)
+
+Fixes
+- **Tor stops when OnionHop exits (#87).** Closing OnionHop while connected could leave tor.exe running in the background with its SOCKS port open: a failure while shutting down the Discord status skipped the cleanup that stops Tor, and ending OnionHop from Task Manager or a crash never ran it at all. Tor now stops first on exit, and on Windows the engines (Tor, Arti, ArtiHop and their bridge transports) are tied to OnionHop, so Windows ends them along with it however it exits.
+- **webtunnel bridges work with an upstream proxy (#88).** The webtunnel transport program cannot use an upstream proxy, so Tor dropped it and the connect failed. With an upstream proxy set, webtunnel now runs through lyrebird, which can.
+- **The page scrollbars show again.** Since the end of May, the scrollbar of Home, Settings and About sat just outside the area those pages were allowed to draw in, so it was cut off completely. On a smaller screen the lower part of Settings could then only be reached with a mouse wheel (user report). The scrollbar now shows at the window's edge again (on the left in right-to-left languages), with its arrow buttons.
+- **Pages scroll with the keyboard.** Page Up and Page Down scroll the current page wherever focus is, even in the menu. After a click on the page's background, the arrow keys, Home and End scroll it too, instead of moving through the menu.
+- **Snowflake works with the AMP cache.** Turning on "AMP cache" (and Smart Connect, which forced it in China, Iran and Turkmenistan) kept Snowflake's usual CDN77 route and only added the AMP cache, a combination its broker rejects, so Snowflake never connected that way. AMP lines now use the route that works with it, fronted through Google like Tor's own AMP lines.
+- **Bridge downloads no longer eat a whole Smart Connect attempt.** On a network that silently drops the bridge sources, fetching bridges could use up an attempt's time before Tor even started. Fetching now gives up after 12 seconds (30 outside Smart Connect) and uses the saved bridges instead.
+
+Smart Connect
+- **Follows Tor's own advice for censored countries.** For the countries Tor itself curates (China, Iran, Russia, Turkmenistan, Belarus, Myanmar, Egypt, Hong Kong), Smart Connect now tries the transports in the order Tor recommends there and uses the bridge lines Tor ships for them, such as Snowflake with the domain fronts that get through in that country, an Amazon SQS rendezvous for China and the AMP cache for Turkmenistan. These are the settings behind Tor Browser's Connection Assist. A copy ships with the app, since Tor's site is blocked in those countries, and it is refreshed through Tor after connecting.
+- **Asks Tor for bridges meant for your country.** obfs4 and webtunnel bridges are requested from Tor's bridge service for the detected country first, the way Tor Browser does, then topped up with the OnionHop collector's tested bridges. Bridges handed out that way are less likely to be on the public lists that censors block.
+- **Plans in seconds on networks that block lookups.** Finding the address and country ran one lookup after another, each waiting up to 30 seconds where it was blocked, so "analyzing the network" could take minutes before the first attempt. The lookups now run side by side and give up after 8 seconds.
+- **Routes that are slow but working get the time they need.** Each attempt has a short budget so that blocked routes fail fast, but routes that were getting through slowly were cut off too, typically Snowflake fetching Tor's directory over a throttled network, and Smart Connect moved on to worse options. Once Tor has completed a handshake through a route, the attempt now continues as long as it keeps making progress, up to 4 minutes.
+- **Learns what fails on your network.** Smart Connect remembered only the route that last worked; the ones that failed were tried again in the same order on every connect, each costing its full wait. A route that failed on your network is now tried last there for the next two days, and moves back to its usual place as soon as it works again.
+- **Knows the country even when it cannot be looked up.** If the lookups are blocked, Smart Connect goes by the country it detected on an earlier connect, or by this computer's time zone, instead of "unknown", which meant trying direct Tor first: exactly what fails where lookups are blocked.
+- **Its quick checks only skip routes that are dead.** Before connecting in a censored country, Smart Connect checks which routes answer. It also used to reorder the working ones by how many bridges answered, which pushed obfs4 to the front even where its bridges answer a connection and are cut off right after. Now routes where nothing answers go last and the rest keep Tor's order.
+- **The bridge scanner checks Snowflake and meek against the right host.** It tested the address hidden inside the fronted request, which is often blocked, instead of the domain front the transport actually connects to, so working lines could show as unreachable.
+
 ## v3.8.6 (2026-10-04)
 
 Fixes

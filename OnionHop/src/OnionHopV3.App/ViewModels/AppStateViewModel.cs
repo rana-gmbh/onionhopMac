@@ -1614,8 +1614,25 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         {
         }
 
-        _discordPresence.Dispose();
-        _client.Dispose();
+        // The client first: it restores the system proxy and DNS and stops Tor. Nothing cosmetic may
+        // stand in its way; an exception from the Discord client used to skip it, leaving tor.exe
+        // running with its SOCKS port open after OnionHop exited (#87).
+        try
+        {
+            _client.Dispose();
+        }
+        catch (Exception ex)
+        {
+            OnionHopV3.Core.Services.StartupLogger.Write($"Dispose: client cleanup failed: {ex.Message}");
+        }
+
+        try
+        {
+            _discordPresence.Dispose();
+        }
+        catch
+        {
+        }
     }
 
     [RelayCommand]
@@ -1712,6 +1729,11 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                     }
 
                     break;
+                }
+
+                if (SmartConnectEnabled && !_connectCts.IsCancellationRequested)
+                {
+                    _smartConnectMemory.RecordFailure(_smartConnectNetworkKey, SmartConnectAdvisor.GetStrategyTransport(strategy));
                 }
 
                 if (index >= strategies.Count - 1)
@@ -1819,9 +1841,11 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         OnionHopConnectOptions baseOptions,
         CancellationToken token)
     {
+        // Set again below once the plan knows the network; until then nothing may be remembered
+        // against the previous connect's network.
+        _smartConnectNetworkKey = null;
         if (!SmartConnectEnabled)
         {
-            _smartConnectNetworkKey = null;
             return [new SmartConnectAdvisor.Strategy("manual", "Smart Connect disabled.", baseOptions)];
         }
 
@@ -1841,10 +1865,22 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                     strategies = await ApplyReachabilityRacingAsync(baseOptions, strategies, token);
                 }
 
+                // Failure memory: what failed on this network in the last two days goes last.
+                _smartConnectNetworkKey = SmartConnectMemory.BuildNetworkKey(plan.CountryCode, plan.PublicIp);
+                var recentlyFailed = _smartConnectMemory.GetRecentlyFailedTransports(_smartConnectNetworkKey);
+                var demoted = SmartConnectAdvisor.DemoteRecentlyFailed(strategies, recentlyFailed);
+                if (!demoted.SequenceEqual(strategies))
+                {
+                    var tryLast = demoted
+                        .Select(SmartConnectAdvisor.GetStrategyTransport)
+                        .Where(recentlyFailed.Contains);
+                    AppendLog($"Smart Connect: trying {string.Join(", ", tryLast)} last (failed on this network recently).");
+                    strategies = demoted;
+                }
+
                 // Success memory: if a strategy is known to have worked on this network before, try it
                 // first. The rest of the ladder stays as the fallback. A failed remembered strategy is
                 // invalidated after the attempt loop (see ConnectAsync).
-                _smartConnectNetworkKey = SmartConnectMemory.BuildNetworkKey(plan.CountryCode, plan.PublicIp);
                 var remembered = _smartConnectMemory.TryGet(_smartConnectNetworkKey);
                 if (remembered != null)
                 {
@@ -1929,10 +1965,10 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             }
 
             var reordered = SmartConnectAdvisor.ReorderByReachability(strategies, reachability);
-            if (reordered.Count > 0 &&
-                !string.Equals(reordered[0].Name, strategies[0].Name, StringComparison.OrdinalIgnoreCase))
+            var unreachable = reachability.Where(kvp => kvp.Value.ReachableCount <= 0).Select(kvp => kvp.Key).ToList();
+            if (unreachable.Count > 0)
             {
-                AppendLog($"Smart Connect: leading with '{SmartConnectAdvisor.GetStrategyTransport(reordered[0])}' (most reachable here).");
+                AppendLog($"Smart Connect: trying {string.Join(", ", unreachable)} last (nothing of it reachable here).");
             }
 
             return reordered;
