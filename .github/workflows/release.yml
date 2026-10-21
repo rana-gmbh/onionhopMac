@@ -128,26 +128,21 @@ jobs:
           file macos/OnionHopMacHelper/onionhop-mac-helper
 
       - name: Fetch macOS sing-box (universal)
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           # sing-box is the TUN core for the osascript (admin-prompt) tunnel path. SagerNet publishes
           # separate darwin-amd64 and darwin-arm64 builds (no universal asset), so fetch both and lipo
           # them into a universal binary at vpn/sing-box (where the app looks).
+          # Pinned to the version OnionHop's tunnel configs are tested against, with the SHA-256s the
+          # app pins (DependencyManager.SingBoxVersion in OnionHopV3.Core): "latest" put a sing-box the
+          # configs were never run with into the DMGs.
+          SING_BOX_VERSION=1.13.13
           mkdir -p build/macos-vpn /tmp/sb-amd64 /tmp/sb-arm64
 
-          AMD64_URL=$(gh api repos/SagerNet/sing-box/releases/latest \
-            --jq '.assets[] | select(.name | test("darwin-amd64\\.tar\\.gz$")) | .browser_download_url')
-          ARM64_URL=$(gh api repos/SagerNet/sing-box/releases/latest \
-            --jq '.assets[] | select(.name | test("darwin-arm64\\.tar\\.gz$")) | .browser_download_url')
-          echo "amd64: $AMD64_URL"
-          echo "arm64: $ARM64_URL"
-          if [ -z "$AMD64_URL" ] || [ -z "$ARM64_URL" ]; then
-            echo "::error::Could not resolve sing-box darwin asset URLs"; exit 1
-          fi
-
-          curl -fsSL "$AMD64_URL" -o /tmp/sb-amd64.tar.gz
-          curl -fsSL "$ARM64_URL" -o /tmp/sb-arm64.tar.gz
+          BASE="https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}"
+          curl -fsSL "$BASE-darwin-amd64.tar.gz" -o /tmp/sb-amd64.tar.gz
+          curl -fsSL "$BASE-darwin-arm64.tar.gz" -o /tmp/sb-arm64.tar.gz
+          echo "477afd64ad7751214f01338ba244265ecc223966ddb58214963f526dca7f424e  /tmp/sb-amd64.tar.gz" | shasum -a 256 -c -
+          echo "4ac414d4ede9ec21bc79d8ccf40b4679429203b9e06ad96d2d8d34c0fe940558  /tmp/sb-arm64.tar.gz" | shasum -a 256 -c -
           tar -xzf /tmp/sb-amd64.tar.gz -C /tmp/sb-amd64
           tar -xzf /tmp/sb-arm64.tar.gz -C /tmp/sb-arm64
 
