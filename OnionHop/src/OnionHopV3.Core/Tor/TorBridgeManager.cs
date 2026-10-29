@@ -89,7 +89,7 @@ internal sealed class TorBridgeManager
     {
         _baseDir = baseDir;
         _bridgeCachePath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            AppDirectories.LocalData,
             "OnionHop V3",
             "bridge-cache.json");
     }
@@ -1915,6 +1915,7 @@ internal sealed class TorBridgeManager
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            psi.WithUtf8Output();
             // Minimal Tor pluggable-transport managed environment so the binary runs its real client
             // startup (where lyrebird exits 2 under Tor), then exits when we close its stdin.
             psi.Environment["TOR_PT_MANAGED_TRANSPORT_VER"] = "1";
@@ -2386,7 +2387,7 @@ internal sealed class TorBridgeManager
     }
 
     // Whether a bridge line is for the given bridge type. OnionHop calls meek_lite "meek".
-    private static bool IsLineForBridgeType(string line, string bridgeType)
+    internal static bool IsLineForBridgeType(string line, string bridgeType)
     {
         var transport = ExtractBridgeTransport(line);
         return transport is not null &&

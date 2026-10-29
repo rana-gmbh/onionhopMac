@@ -192,10 +192,8 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     private readonly TorNodeDatabaseService _nodeDatabaseService = new();
     private readonly DiscordPresenceService _discordPresence = new();
     private readonly SmartConnectAdvisor _smartConnectAdvisor = new();
-    private readonly SmartConnectMemory _smartConnectMemory = new();
-    // The network key (country + IP prefix) for the in-flight Smart Connect attempt, so a success can
-    // be remembered / a stale memory invalidated against the right network.
-    private string? _smartConnectNetworkKey;
+    // Orders Smart Connect's attempts and remembers how they went, the same way as the CLI.
+    private readonly SmartConnectSession _smartConnectSession;
     private CancellationTokenSource? _connectCts;
     private CancellationTokenSource? _settingsSaveCts;
     private DispatcherTimer? _bridgeRefreshTimer;
@@ -323,6 +321,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
 
         _settingsService = new SettingsService(Program.OverrideBaseDirectory);
         _client = new OnionHopClient(Program.OverrideBaseDirectory);
+        _smartConnectSession = new SmartConnectSession(_client, _smartConnectAdvisor, new SmartConnectMemory());
         _client.Log += (_, message) => EnqueueClientLog(message);
         _client.DnsLog += (_, message) => EnqueueDnsLog(message);
         _client.VpnLog += (_, message) => Dispatcher.UIThread.Post(() => AppendVpnLog(message));
@@ -1687,10 +1686,9 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                 // On Linux the system DNS proxy (what "DNS leak protection" turns on) needs root, and
                 // nothing else in Proxy Mode does. Leave the system's DNS alone instead of refusing to
                 // connect (#84): Smart Connect already did that, but with Smart Connect off the same
-                // default setting made even local-proxy mode demand root. TUN mode really needs root
-                // and is still checked below.
+                // default setting made even local-proxy mode demand root. TUN mode without root runs
+                // only the tunnel as root (pkexec, #90), and the tunnel sends DNS through Tor itself.
                 if (attemptOptions.OnionDnsProxyEnabled &&
-                    !IsTunModeOption(attemptOptions) &&
                     !PlatformHelper.IsAdministrator() &&
                     !OperatingSystem.IsWindows() &&
                     !OperatingSystem.IsMacOS())
@@ -1698,8 +1696,10 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                     attemptOptions = attemptOptions with { OnionDnsProxyEnabled = false, FullDnsOverTor = false };
                     if (index == 0)
                     {
-                        AppendLog("DNS leak protection needs root on Linux, so this session leaves the system's DNS alone. " +
-                                  "Apps that send host names through OnionHop's proxy still have them resolved by Tor.");
+                        AppendLog(IsTunModeOption(attemptOptions)
+                            ? "The tunnel sends DNS through Tor itself. The system DNS settings need OnionHop itself to run as root on Linux, so this session leaves them alone."
+                            : "DNS leak protection needs root on Linux, so this session leaves the system's DNS alone. " +
+                              "Apps that send host names through OnionHop's proxy still have them resolved by Tor.");
                     }
                 }
 
@@ -1714,6 +1714,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                 }
 
                 OnionHopV3.Core.Services.StartupLogger.Write("ConnectAsync: Calling _client.ConnectAsync...");
+                var attemptClock = Stopwatch.StartNew();
                 await _client.ConnectAsync(attemptOptions, _connectCts.Token);
                 OnionHopV3.Core.Services.StartupLogger.Write("ConnectAsync: _client.ConnectAsync completed");
 
@@ -1722,10 +1723,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
                     // Remember the winning transport for this network so the next connect leads with it.
                     if (SmartConnectEnabled)
                     {
-                        _smartConnectMemory.RecordSuccess(
-                            _smartConnectNetworkKey,
-                            SmartConnectAdvisor.GetStrategyTransport(strategy),
-                            attemptOptions.UseTorBridges);
+                        _smartConnectSession.RecordAttempt(strategy, attemptClock.Elapsed);
                     }
 
                     break;
@@ -1733,7 +1731,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
 
                 if (SmartConnectEnabled && !_connectCts.IsCancellationRequested)
                 {
-                    _smartConnectMemory.RecordFailure(_smartConnectNetworkKey, SmartConnectAdvisor.GetStrategyTransport(strategy));
+                    _smartConnectSession.RecordAttempt(strategy, attemptClock.Elapsed);
                 }
 
                 if (index >= strategies.Count - 1)
@@ -1751,7 +1749,7 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             {
                 // Everything failed - whatever we remembered for this network no longer works
                 // (censors move), so forget it and re-derive fresh next time.
-                _smartConnectMemory.Invalidate(_smartConnectNetworkKey);
+                _smartConnectSession.RecordAllFailed();
                 StatusMessage = "Smart Connect exhausted all fallback strategies. Try manual settings if needed.";
             }
         }
@@ -1841,147 +1839,17 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         OnionHopConnectOptions baseOptions,
         CancellationToken token)
     {
-        // Set again below once the plan knows the network; until then nothing may be remembered
-        // against the previous connect's network.
-        _smartConnectNetworkKey = null;
         if (!SmartConnectEnabled)
         {
             return [new SmartConnectAdvisor.Strategy("manual", "Smart Connect disabled.", baseOptions)];
         }
 
-        try
-        {
-            var plan = await _smartConnectAdvisor.BuildPlanAsync(baseOptions, AppendLog, token);
-            if (plan.Strategies.Count > 0)
-            {
-                var strategies = plan.Strategies;
-
-                // Reachability racing: for restricted/severe networks, concurrently probe which bridge
-                // transports actually have live bridges here and lead with the one that does, instead
-                // of trying them in a fixed order. This is the safe form of racing - cheap probes up
-                // front, then a single clean connect (never multiple live Tor processes at once).
-                if (plan.Risk is SmartConnectAdvisor.RiskLevel.Restricted or SmartConnectAdvisor.RiskLevel.Severe)
-                {
-                    strategies = await ApplyReachabilityRacingAsync(baseOptions, strategies, token);
-                }
-
-                // Failure memory: what failed on this network in the last two days goes last.
-                _smartConnectNetworkKey = SmartConnectMemory.BuildNetworkKey(plan.CountryCode, plan.PublicIp);
-                var recentlyFailed = _smartConnectMemory.GetRecentlyFailedTransports(_smartConnectNetworkKey);
-                var demoted = SmartConnectAdvisor.DemoteRecentlyFailed(strategies, recentlyFailed);
-                if (!demoted.SequenceEqual(strategies))
-                {
-                    var tryLast = demoted
-                        .Select(SmartConnectAdvisor.GetStrategyTransport)
-                        .Where(recentlyFailed.Contains);
-                    AppendLog($"Smart Connect: trying {string.Join(", ", tryLast)} last (failed on this network recently).");
-                    strategies = demoted;
-                }
-
-                // Success memory: if a strategy is known to have worked on this network before, try it
-                // first. The rest of the ladder stays as the fallback. A failed remembered strategy is
-                // invalidated after the attempt loop (see ConnectAsync).
-                var remembered = _smartConnectMemory.TryGet(_smartConnectNetworkKey);
-                if (remembered != null)
-                {
-                    var promoted = SmartConnectAdvisor.PromoteRememberedStrategy(strategies, remembered.Transport);
-                    if (promoted.Count > 0 &&
-                        !string.Equals(promoted[0].Name, strategies[0].Name, StringComparison.OrdinalIgnoreCase))
-                    {
-                        AppendLog($"Smart Connect: trying '{remembered.Transport}' first (worked on this network before).");
-                    }
-
-                    return promoted;
-                }
-
-                return strategies;
-            }
-
-            _smartConnectNetworkKey = null;
-            AppendLog("Smart Connect planner returned no strategies. Falling back to generic profile.");
-        }
-        // Only real cancellation aborts the connect. HttpClient timeouts inside the planner throw
-        // TaskCanceledException too; those must fall through to the generic profile below (#65).
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"Smart Connect planner failed: {ex.Message}. Falling back to generic profile.");
-        }
-
-        var genericFallback = SmartConnectAdvisor.BuildStrategiesForRisk(baseOptions, SmartConnectAdvisor.RiskLevel.Unknown);
-        if (genericFallback.Count > 0)
-        {
-            return genericFallback;
-        }
-
-        return [new SmartConnectAdvisor.Strategy("manual", "Fallback to current settings.", baseOptions)];
-    }
-
-    // Total wall-clock budget for the up-front reachability race. Probes run concurrently, so this is
-    // roughly one round of probing, not the sum across transports.
-    private static readonly TimeSpan ReachabilityRaceBudget = TimeSpan.FromSeconds(8);
-
-    /// <summary>
-    /// Concurrently measure which bridge transports have live bridges on this network and reorder the
-    /// strategy ladder to lead with the most reachable one. Best-effort: any failure / timeout leaves
-    /// the ladder unchanged. This is the "racing" win without the danger of multiple live Tor stacks.
-    /// </summary>
-    private async Task<IReadOnlyList<SmartConnectAdvisor.Strategy>> ApplyReachabilityRacingAsync(
-        OnionHopConnectOptions baseOptions,
-        IReadOnlyList<SmartConnectAdvisor.Strategy> strategies,
-        CancellationToken token)
-    {
-        try
-        {
-            // Probe the distinct probeable bridge transports that appear in the ladder.
-            var transports = strategies
-                .Where(s => s.Options.UseTorBridges)
-                .Select(SmartConnectAdvisor.GetStrategyTransport)
-                .Where(t => !string.IsNullOrWhiteSpace(t))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-
-            if (transports.Count < 2)
-            {
-                return strategies;
-            }
-
-            UpdatePreparationStatus("Smart Connect is checking which bridges are reachable...", 0.05);
-            var reachability = await _client.ProbeTransportReachabilityAsync(
-                baseOptions, transports, ReachabilityRaceBudget, token).ConfigureAwait(false);
-
-            if (reachability.Count == 0)
-            {
-                return strategies;
-            }
-
-            foreach (var kvp in reachability)
-            {
-                AppendLog($"Smart Connect reachability: {kvp.Key} -> {kvp.Value.ReachableCount} reachable" +
-                          (kvp.Value.FastestPingMs.HasValue ? $" (fastest {kvp.Value.FastestPingMs} ms)." : "."));
-            }
-
-            var reordered = SmartConnectAdvisor.ReorderByReachability(strategies, reachability);
-            var unreachable = reachability.Where(kvp => kvp.Value.ReachableCount <= 0).Select(kvp => kvp.Key).ToList();
-            if (unreachable.Count > 0)
-            {
-                AppendLog($"Smart Connect: trying {string.Join(", ", unreachable)} last (nothing of it reachable here).");
-            }
-
-            return reordered;
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"Smart Connect: reachability race skipped ({ex.Message}).");
-            return strategies;
-        }
+        return await _smartConnectSession.BuildStrategiesAsync(
+            baseOptions,
+            AppendLog,
+            AppendLog,
+            message => UpdatePreparationStatus(message, 0.05),
+            token);
     }
 
     private async Task<bool> EnsureAdminRequirementsForConnectAsync(OnionHopConnectOptions options)
@@ -2038,7 +1906,16 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
             return true;
         }
 
-        StatusMessage = "This mode requires root privileges on this platform. Please relaunch OnionHop with elevated permissions.";
+        // Linux without root: the tunnel core asks for root through polkit when it starts (#90).
+        if (OperatingSystem.IsLinux() && IsTunModeOption(options) && !options.OnionDnsProxyEnabled && OnionHopClient.CanElevateTunnelWithPkexec)
+        {
+            AppendLog("Linux will ask for your password (polkit) before starting the tunnel. Only the tunnel runs as root; OnionHop stays in your session.");
+            return true;
+        }
+
+        StatusMessage = OperatingSystem.IsLinux() && IsTunModeOption(options)
+            ? "TUN/VPN mode needs root on Linux, and polkit's pkexec is not installed to ask for it. Install pkexec, or relaunch OnionHop with elevated permissions."
+            : "This mode requires root privileges on this platform. Please relaunch OnionHop with elevated permissions.";
         return false;
     }
 

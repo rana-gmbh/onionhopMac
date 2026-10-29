@@ -1,5 +1,36 @@
 # Changelog
 
+## v3.10 (2026-10-29)
+
+Fixes
+- **The exit IP shows up on slow connections.** The lookup right after connecting had one 18-second try, and over a slow bridge the IP then showed as `--.--.--.--` for the whole session. It is now tried again in the background.
+- **The Scanner page works in short windows.** Its results list got whatever height the scan settings left, often none at all. The page now scrolls, and the list keeps a usable height.
+- **Every package ships the same sing-box.** The Windows portable zip and the macOS DMGs took whatever sing-box was newest when they were built, instead of the version OnionHop's tunnel settings are tested with, and the Linux and macOS CLI were a version behind. All now bundle sing-box 1.13.13, and the build checks the sing-box and Xray downloads against pinned checksums.
+- **The Snowflake proxy's traffic numbers show correctly on Windows (#91).** snowflake-proxy writes its traffic with arrows (↓ ↑) that OnionHop read in the Windows code page, which turned them into "鈫?" on Chinese Windows and into other garbage elsewhere. The output of the transport and tunnel programs is now read as the UTF-8 they write.
+- **A timed-out attempt says where it stopped (#89).** Instead of "Connection canceled or timed out.", a timeout names the step Tor had reached and what that means, for example "Timed out at 5% (Connecting to a relay): no connection to a bridge or relay got through", along with how many connections the transport reported failing.
+- **The CLI starts on a fresh Linux account.** Where `~/.config` did not exist yet, as for the service user in the README's systemd example, OnionHop got an empty path for its data folders, so the CLI crashed at startup or wrote its data into the working directory. The folders are now created when missing.
+- **The Linux CLI package works for every user.** Tor, its libraries and its geoip files came out of the Tor Project's bundle readable by their owner only, so the CLI could not start Tor when one user unpacked the package and another ran it, as in the README's systemd setup (unpacked with sudo, run as a service user).
+
+Smart Connect
+- **Checks every route before connecting, all at once.** In censored countries Smart Connect first checks which routes answer. It checked them one after another, so on a slow network often only the first got checked in time, and it skipped Snowflake, meek, conjure and dnstt entirely, the routes that matter most where censorship is heaviest. All routes are now checked side by side. For those four it tests a real TLS connection to the domain fronts, Amazon SQS queue or DNS resolver they actually connect to, using Tor's lines for your country, since censors block these by name. Routes where nothing answers are tried last.
+- **The command line version works like the app (#89).** It took Smart Connect's bare plan and remembered nothing, so on every connect it spent a minute or more on routes that had just failed before reaching the one that works on that network. It now runs the same reachability check as the app, tries what failed there recently last and what worked there before first, and remembers how each attempt went.
+- **Tells your networks apart where the address lookups are blocked (#89).** Smart Connect remembers what works per network, keyed on your public address. Where the lookups for that address are blocked, every network in the country shared one memory. It now goes by the router your computer connects through instead, so a home connection and a phone's hotspot keep separate memories. The CLI's `plan` shows what results are remembered under.
+
+Linux
+- **TUN mode without running OnionHop as root (#90).** TUN/VPN mode told you to relaunch the whole app with sudo, which separates the settings from your user and leaves root-owned files behind. OnionHop now asks for your password through polkit (`pkexec`) when the tunnel starts, as the macOS app does, and runs only the tunnel as root. This works in the CLI too. The kill switch and the system DNS settings still need OnionHop itself to run as root.
+
+CLI
+- **Builds for ARM Linux (#89).** The CLI is now also published for 64-bit ARM (`linux-arm64`) and 32-bit ARMv7 (`linux-arm`), for example for a Raspberry Pi that shares Tor with its network. The Tor Project publishes no stable Linux ARM build of Tor, so for these Tor and its transports are built from source.
+- **Shares Tor with your network: `connect --lan on`.** The SOCKS and HTTP proxy then listen on every network interface instead of only this computer, and the CLI lists the addresses other devices can use.
+- **Or on one interface: `--lan-interface wlan0`.** On a router, sharing on every interface includes the side facing the internet. This shares the proxy only on the interface you name, such as the router's LAN side.
+- **`--bridge-type` counts with Smart Connect on.** Smart Connect built its own list and ignored it. The chosen bridge type is now tried first, with Smart Connect's plan as the fallback, and `plan` shows the order connect will really use.
+- **Says how each attempt went.** Each failed attempt is reported with its time and reason, the connect with the route that worked and how long it took, also in startup.log.
+- **`--sni host1,host2`** sets the fronts used by the chosen snowflake, meek or webtunnel bridges, like the custom SNI hosts in the app.
+- **`--help` and `-h` work.** They answered "Unknown command".
+- **Stops cleanly when a service manager stops it.** SIGTERM (systemd, Docker, `kill`) and SIGHUP (a closed SSH session) ended the CLI on the spot without disconnecting, which left Tor running after a plain `kill`. Both now disconnect and stop Tor first, like Ctrl+C. The README shows how to run the CLI as a systemd service.
+- **Readable logs when the output is not a terminal.** Under systemd or in a log file, the progress spinner wrote a new copy of its line many times a second. It now writes the step once.
+- **Starts without libicu.** .NET refused to start on systems without the libicu package, which minimal installs often lack. The CLI no longer needs it, and `json on` output now writes numbers the same way in every language, where the `plan` score used to get a decimal comma.
+
 ## v3.9 (2026-10-14)
 
 Fixes

@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -141,6 +142,8 @@ public sealed class OnionHopClient : IDisposable
     // The engine's own bootstrap percentage for the current attempt (Tor's "Bootstrapped N%",
     // ArtiHop's "bootstrap progress"), read by WatchAttemptDeadlineAsync from another thread.
     private volatile int _bootstrapPercent;
+    // The text of the last bootstrap step ("Connecting to a relay"), so a timeout can say where it stopped.
+    private volatile string? _bootstrapSummary;
     private string _currentIp = "--.--.--.--";
 
     private bool _dependencyDownloadInProgress;
@@ -153,6 +156,9 @@ public sealed class OnionHopClient : IDisposable
     private int _activeSocksPort = DefaultSocksPort;
     private int? _activeHttpPort;
     private string _activeProxyBindAddress = "127.0.0.1";
+    // The one interface the proxy is shared on (LanBindAddress), and the relays serving it there.
+    private IPAddress? _lanShareAddress;
+    private readonly List<TcpRelay> _lanShareRelays = [];
     private int? _activeDnsPort;
     private string? _activeDnsBindAddress;
     private string _activeTorEngine = OnionHopConnectOptions.TorEngineClassic;
@@ -206,7 +212,7 @@ public sealed class OnionHopClient : IDisposable
     {
         try
         {
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var localAppData = AppDirectories.LocalData;
             if (!string.IsNullOrWhiteSpace(localAppData))
             {
                 var runtimeDir = Path.Combine(localAppData, "OnionHop");
@@ -289,6 +295,9 @@ public sealed class OnionHopClient : IDisposable
     /// <summary>True for the meta "automatic" bridge type.</summary>
     public static bool IsAutomaticBridgeType(string? bridgeType) => TorBridgeManager.IsAutomaticBridgeType(bridgeType);
 
+    /// <summary>Whether TUN mode can ask for root through polkit on this Linux system (#90).</summary>
+    public static bool CanElevateTunnelWithPkexec => VpnService.CanElevateWithPkexec;
+
     /// <summary>True when a bridge transport has a fixed IP:port that can be reachability-probed.</summary>
     public static bool BridgeTypeHasProbeableEndpoint(string? bridgeType) => TorBridgeManager.BridgeTypeHasProbeableEndpoint(bridgeType);
 
@@ -320,95 +329,143 @@ public sealed class OnionHopClient : IDisposable
     }
 
     /// <summary>
-    /// Concurrently measure which bridge transports have reachable bridges from this network, so
-    /// Smart Connect can lead with the transport that actually works here instead of trying them in a
-    /// fixed order. For each transport we fetch its candidate bridges and TCP-probe them in parallel
-    /// (the same reachability scan used before launch); the result maps transport -> (reachable count,
-    /// fastest ping). Fronted transports (snowflake/dnstt) have no probeable endpoint and are omitted
-    /// (the caller leaves them in their default position). This is the safe form of "racing": we race
-    /// cheap reachability probes up front, then run a single clean connect - never multiple live Tor
-    /// processes mutating system proxy/DNS/TUN state at once.
+    /// Measure which bridge transports get through from this network, so Smart Connect can skip the
+    /// ones that certainly fail. All transports are probed at the same time, within one budget:
+    /// <list type="bullet">
+    /// <item>obfs4/webtunnel/vanilla: fetch their candidate bridges and scan them (TCP, and
+    /// webtunnel's real WebSocket upgrade), the same scan used before launch. The fetch doubles as
+    /// a prefetch: the attempt reuses what it found.</item>
+    /// <item>fronted transports (snowflake, meek, conjure, dnstt): a TLS handshake, with the host as
+    /// SNI, to the hosts they connect to first: their domain fronts, SQS queue or DoH resolver. A
+    /// censor blocks these by SNI, which a TCP probe alone does not see.</item>
+    /// </list>
+    /// The result maps transport -> (reachable bridges or hosts, fastest ms); a transport missing
+    /// from it could not be measured in time. This is the safe form of "racing": cheap probes up
+    /// front, then a single clean connect - never multiple live Tor processes mutating system
+    /// proxy/DNS/TUN state at once.
     /// </summary>
-    public async Task<IReadOnlyDictionary<string, (int ReachableCount, int? FastestPingMs)>> ProbeTransportReachabilityAsync(
+    public Task<IReadOnlyDictionary<string, (int ReachableCount, int? FastestPingMs)>> ProbeTransportReachabilityAsync(
         OnionHopConnectOptions options,
         IReadOnlyList<string> transports,
         TimeSpan budget,
         CancellationToken token)
-    {
-        var result = new Dictionary<string, (int, int?)>(StringComparer.OrdinalIgnoreCase);
-        if (transports.Count == 0)
-        {
-            return result;
-        }
+        => ProbeTransportReachabilityAsync(transports.Select(transport => (transport, options)).ToList(), budget, token);
 
+    /// <param name="candidates">
+    /// Each transport with the options its attempt will use; Smart Connect's carry Tor's bridge lines
+    /// for the user's country, so those are what gets probed.
+    /// </param>
+    public async Task<IReadOnlyDictionary<string, (int ReachableCount, int? FastestPingMs)>> ProbeTransportReachabilityAsync(
+        IReadOnlyList<(string Transport, OnionHopConnectOptions Options)> candidates,
+        TimeSpan budget,
+        CancellationToken token)
+    {
         using var budgetCts = CancellationTokenSource.CreateLinkedTokenSource(token);
         budgetCts.CancelAfter(budget);
 
-        try
+        var probes = candidates
+            .Select(candidate => (Transport: candidate.Transport?.Trim().ToLowerInvariant() ?? string.Empty, candidate.Options))
+            .Where(candidate => candidate.Transport.Length > 0 && !TorBridgeManager.IsAutomaticBridgeType(candidate.Transport))
+            .DistinctBy(candidate => candidate.Transport)
+            .Select(candidate => ProbeTransportAsync(
+                candidate.Transport,
+                candidate.Options with { SelectedBridgeType = candidate.Transport, UseTorBridges = true },
+                budgetCts.Token))
+            .ToList();
+        var outcomes = await Task.WhenAll(probes).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+
+        var result = new Dictionary<string, (int, int?)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (transport, outcome) in outcomes)
         {
-            foreach (var transport in transports.Distinct(StringComparer.OrdinalIgnoreCase))
+            if (outcome is { } measured)
             {
-                budgetCts.Token.ThrowIfCancellationRequested();
-
-                // Skip the meta "automatic" type and fronted transports with no pingable endpoint.
-                if (TorBridgeManager.IsAutomaticBridgeType(transport) ||
-                    !TorBridgeManager.BridgeTypeHasProbeableEndpoint(transport))
-                {
-                    continue;
-                }
-
-                IReadOnlyList<string> lines;
-                try
-                {
-                    var probeOptions = options with { SelectedBridgeType = transport, UseTorBridges = true };
-                    lines = await _bridgeManager.GetBridgeLinesAsync(probeOptions, _ptConfig, _ => { }, budgetCts.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!token.IsCancellationRequested)
-                {
-                    break; // budget elapsed
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (lines.Count == 0)
-                {
-                    continue;
-                }
-
-                IReadOnlyList<BridgeScanResult> scan;
-                try
-                {
-                    scan = await BridgeScanService.ScanAsync(lines, 24, TimeSpan.FromSeconds(3), progress: null, budgetCts.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!token.IsCancellationRequested)
-                {
-                    break;
-                }
-                catch
-                {
-                    continue;
-                }
-
-                var working = scan.Where(r => r.IsWorking).ToList();
-                if (working.Count > 0)
-                {
-                    var fastest = working.Where(r => r.PingMs.HasValue).Select(r => r.PingMs!.Value).DefaultIfEmpty(int.MaxValue).Min();
-                    result[transport] = (working.Count, fastest == int.MaxValue ? null : fastest);
-                }
-                else
-                {
-                    result[transport] = (0, null);
-                }
+                result[transport] = measured;
             }
-        }
-        catch (OperationCanceledException) when (!token.IsCancellationRequested)
-        {
-            // budget elapsed - return what we have
         }
 
         return result;
+    }
+
+    // How long one fronted host gets for its TCP connect and TLS handshake, and how many hosts of a
+    // transport are tried (they are tried at the same time).
+    private static readonly TimeSpan FrontedProbeTimeout = TimeSpan.FromSeconds(4);
+    private const int MaxFrontedProbeHosts = 6;
+
+    // One transport's probe. Null when it could not be measured: the budget ran out, the user
+    // cancelled (the caller checks), or there was nothing to probe.
+    private async Task<(string Transport, (int ReachableCount, int? FastestPingMs)? Outcome)> ProbeTransportAsync(
+        string transport,
+        OnionHopConnectOptions options,
+        CancellationToken token)
+    {
+        try
+        {
+            if (TorBridgeManager.BridgeTypeHasProbeableEndpoint(transport))
+            {
+                var lines = await _bridgeManager.GetBridgeLinesAsync(options, _ptConfig, _ => { }, token).ConfigureAwait(false);
+                if (lines.Count == 0)
+                {
+                    return (transport, null);
+                }
+
+                var scan = await BridgeScanService.ScanAsync(lines, 24, TimeSpan.FromSeconds(3), progress: null, token).ConfigureAwait(false);
+                return (transport, SummarizeReachability(scan.Where(result => result.IsWorking).Select(result => result.PingMs)));
+            }
+
+            var hosts = FrontedProbeHosts(transport, options, _ptConfig);
+            if (hosts.Count == 0)
+            {
+                return (transport, null);
+            }
+
+            var handshakes = await Task.WhenAll(hosts.Select(host => BridgeScanService.ProbeTlsAsync(host, 443, FrontedProbeTimeout, token))).ConfigureAwait(false);
+            return (transport, SummarizeReachability(handshakes.Where(ms => ms.HasValue)));
+        }
+        catch
+        {
+            return (transport, null);
+        }
+    }
+
+    private static (int ReachableCount, int? FastestPingMs) SummarizeReachability(IEnumerable<int?> reachablePings)
+    {
+        var pings = reachablePings.ToList();
+        var fastest = pings.Where(ping => ping.HasValue).Select(ping => ping!.Value).DefaultIfEmpty(int.MaxValue).Min();
+        return (pings.Count, fastest == int.MaxValue ? null : fastest);
+    }
+
+    /// <summary>
+    /// The hosts a fronted transport's attempt connects to first, from the lines that attempt will
+    /// use: Tor's lines for the user's country when Smart Connect has them, else the bundled ones
+    /// (pt_config, then the scanner's built-in set), with the AMP rewrite applied when AMP is on,
+    /// since that moves Snowflake to a Google front.
+    /// </summary>
+    internal static IReadOnlyList<string> FrontedProbeHosts(string transport, OnionHopConnectOptions options, PluggableTransportConfig? config)
+    {
+        IReadOnlyList<string> lines = (options.CountryBridgeLines ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => TorBridgeManager.IsLineForBridgeType(line, transport))
+            .ToList();
+        if (lines.Count == 0)
+        {
+            if (config?.Bridges != null && config.Bridges.TryGetValue(transport, out var bundled) && bundled.Count > 0)
+            {
+                lines = bundled;
+            }
+            else if (BridgeSourceService.BuiltInBridges.TryGetValue(transport, out var builtIn))
+            {
+                lines = builtIn;
+            }
+
+            lines = TorBridgeManager.ApplySnowflakeAmpCacheToBridges(options, lines, static _ => { });
+        }
+
+        return lines
+            .SelectMany(BridgeScanService.ExtractConnectHosts)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(MaxFrontedProbeHosts)
+            .ToList();
     }
 
     public async Task<BridgeDataRefreshStatus> RefreshBridgeDistributionAsync(OnionHopConnectOptions options, CancellationToken token = default)
@@ -867,10 +924,13 @@ public sealed class OnionHopClient : IDisposable
 
         _activeDnsPort = null;
         _activeDnsBindAddress = null;
-        _activeProxyBindAddress = options.AllowLanProxyAccess ? "0.0.0.0" : "127.0.0.1";
-        if (options.AllowLanProxyAccess)
+        var lanShareError = ResolveLanShare(options);
+        _activeProxyBindAddress = options.AllowLanProxyAccess && _lanShareAddress == null ? "0.0.0.0" : "127.0.0.1";
+        if (options.AllowLanProxyAccess && lanShareError == null)
         {
-            RaiseLog("LAN proxy access enabled: SOCKS/HTTP listeners will accept connections from local network interfaces.");
+            RaiseLog(_lanShareAddress == null
+                ? "LAN proxy access enabled: SOCKS/HTTP listeners will accept connections from local network interfaces."
+                : $"LAN proxy access enabled on {_lanShareAddress} only: SOCKS/HTTP accept connections from that interface and this computer.");
         }
 
         if (options.OnionDnsProxyEnabled)
@@ -933,6 +993,7 @@ public sealed class OnionHopClient : IDisposable
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(token);
         using var stopDeadlineWatch = new CancellationTokenSource();
         _bootstrapPercent = 0;
+        _bootstrapSummary = null;
         if (progressAwareDeadline)
         {
             _ = WatchAttemptDeadlineAsync(connectTimeout!.Value, timeoutCts, stopDeadlineWatch.Token);
@@ -964,6 +1025,11 @@ public sealed class OnionHopClient : IDisposable
 
         try
         {
+            if (lanShareError != null)
+            {
+                throw new InvalidOperationException(lanShareError);
+            }
+
             var xrayTunCompatibilityProxyApplied = false;
             RaiseLog($"Connecting. Engine={ResolveEffectiveTorEngine(options)}, Mode={options.SelectedConnectionMode}, Hybrid={options.UseHybridRouting}, Exit={options.SelectedLocation}, Bridges={(options.UseTorBridges ? options.SelectedBridgeType : "off")}");
 
@@ -1039,6 +1105,8 @@ public sealed class OnionHopClient : IDisposable
             {
                 await StartHttpProxyBridgeAsync(timeoutCts.Token).ConfigureAwait(false);
             }
+
+            StartLanShareRelays();
 
             if (IsTunMode(resolvedOptions) &&
                 string.Equals(_activeVpnCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal))
@@ -1161,6 +1229,7 @@ public sealed class OnionHopClient : IDisposable
             PublishStatus();
 
             await RefreshIpAsync(updateStatusMessage: false, CancellationToken.None).ConfigureAwait(false);
+            StartExitIpRetryIfUnknown();
 
             // Refresh the geo rule-set cache through Tor in the background (issue #68 follow-up):
             // raw.githubusercontent.com is blocked exactly where those rules matter most, so fetch
@@ -1177,9 +1246,19 @@ public sealed class OnionHopClient : IDisposable
         catch (OperationCanceledException)
         {
             var canceledByUser = token.IsCancellationRequested;
+            int proxyFailures;
+            lock (_bridgeFailureLock)
+            {
+                proxyFailures = _totalTorProxyFailures;
+            }
+
             var canceledMessage = canceledByUser || !connectTimeout.HasValue
                 ? "Connection canceled."
-                : "Connection canceled or timed out.";
+                : DescribeAttemptTimeout(
+                    _bootstrapPercent,
+                    _bootstrapSummary,
+                    proxyFailures,
+                    torPhases: string.Equals(_activeTorEngine, OnionHopConnectOptions.TorEngineClassic, StringComparison.Ordinal));
             RaiseLog(canceledMessage);
             MaybeLogTransportBlockedHint();
             await DisconnectCoreAsync(disableStatusUpdate: true).ConfigureAwait(false);
@@ -2400,6 +2479,7 @@ public sealed class OnionHopClient : IDisposable
         try
         {
             _httpProxyBridgeService.Stop();
+            StopLanShareRelays();
         }
         catch (Exception ex)
         {
@@ -2744,6 +2824,7 @@ public sealed class OnionHopClient : IDisposable
             await Task.Run(() =>
             {
                 _httpProxyBridgeService.Stop();
+                StopLanShareRelays();
                 StopSingBoxProcess();
 
                 // A kill switch that has fired outlives this teardown on purpose (see
@@ -2837,20 +2918,23 @@ public sealed class OnionHopClient : IDisposable
         }
     }
 
+    /// <summary>The state <see cref="StatusUpdated"/> last reported, read on demand.</summary>
+    public StatusUpdate CurrentStatus => new(
+        IsConnecting: _isConnecting,
+        IsConnected: _isConnected,
+        IsDisconnecting: _isDisconnecting,
+        ConnectionStatus: _connectionStatus,
+        StatusMessage: _statusMessage,
+        ConnectionProgress: _connectionProgress,
+        CurrentIp: _currentIp,
+        SocksPort: _activeSocksPort,
+        HttpPort: _activeHttpPort,
+        TunnelCheck: _tunnelCheck,
+        KillSwitchHolding: _killSwitchHolding);
+
     private void PublishStatus()
     {
-        StatusUpdated?.Invoke(this, new StatusUpdate(
-            IsConnecting: _isConnecting,
-            IsConnected: _isConnected,
-            IsDisconnecting: _isDisconnecting,
-            ConnectionStatus: _connectionStatus,
-            StatusMessage: _statusMessage,
-            ConnectionProgress: _connectionProgress,
-            CurrentIp: _currentIp,
-            SocksPort: _activeSocksPort,
-            HttpPort: _activeHttpPort,
-            TunnelCheck: _tunnelCheck,
-            KillSwitchHolding: _killSwitchHolding));
+        StatusUpdated?.Invoke(this, CurrentStatus);
     }
 
     private void PublishDependency()
@@ -3303,6 +3387,7 @@ public sealed class OnionHopClient : IDisposable
             TorPath = torPath,
             SocksPort = _activeSocksPort,
             SocksListenAddress = _activeProxyBindAddress,
+            AdditionalSocksListenAddresses = _lanShareAddress is { } lan ? [lan.ToString()] : null,
             HttpTunnelPort = null,
             HttpTunnelListenAddress = null,
             DnsPort = options.OnionDnsProxyEnabled ? _activeDnsPort : null,
@@ -3559,6 +3644,87 @@ public sealed class OnionHopClient : IDisposable
         PublishStatus();
     }
 
+    // Sets the interface this connect shares the proxy on; returns why the requested one cannot be used.
+    private string? ResolveLanShare(OnionHopConnectOptions options)
+    {
+        _lanShareAddress = null;
+        if (!options.AllowLanProxyAccess || string.IsNullOrWhiteSpace(options.LanBindAddress))
+        {
+            return null;
+        }
+
+        var resolved = LanAddressFinder.ResolveShareAddress(options.LanBindAddress);
+        if (resolved == null)
+        {
+            return $"{options.LanBindAddress.Trim()} is not a network interface or IPv4 address of this computer, so the proxy cannot be shared on it.";
+        }
+
+        _lanShareAddress = resolved.Address;
+        return null;
+    }
+
+    // Shares the proxy on the one chosen interface. Tor listens there itself (a second SocksPort,
+    // which keeps its per-device circuit isolation); Arti, ArtiHop and the HTTP proxy listen on
+    // loopback only, so a relay forwards that interface's connections to them.
+    private void StartLanShareRelays()
+    {
+        if (_lanShareAddress is not { } lan)
+        {
+            return;
+        }
+
+        if (!string.Equals(_activeTorEngine, OnionHopConnectOptions.TorEngineClassic, StringComparison.Ordinal))
+        {
+            // Sharing SOCKS is the point of LAN access, so failing here fails the connect.
+            StartLanShareRelay(lan, _activeSocksPort, "SOCKS");
+        }
+
+        if (_activeHttpPort is { } httpPort)
+        {
+            try
+            {
+                StartLanShareRelay(lan, httpPort, "HTTP");
+            }
+            catch (Exception ex)
+            {
+                RaiseLog(ex.Message);
+            }
+        }
+    }
+
+    private void StartLanShareRelay(IPAddress lan, int port, string label)
+    {
+        try
+        {
+            var relay = TcpRelay.Start(new IPEndPoint(lan, port), new IPEndPoint(IPAddress.Loopback, port));
+            lock (_lanShareRelays)
+            {
+                _lanShareRelays.Add(relay);
+            }
+
+            RaiseLog($"{label} proxy shared on {lan}:{port}.");
+        }
+        catch (SocketException ex)
+        {
+            throw new InvalidOperationException($"Could not share the {label} proxy on {lan}:{port}: {ex.Message}", ex);
+        }
+    }
+
+    private void StopLanShareRelays()
+    {
+        List<TcpRelay> relays;
+        lock (_lanShareRelays)
+        {
+            relays = [.. _lanShareRelays];
+            _lanShareRelays.Clear();
+        }
+
+        foreach (var relay in relays)
+        {
+            relay.Dispose();
+        }
+    }
+
     private async Task StartHttpProxyBridgeAsync(CancellationToken token)
     {
         if (!_activeHttpPort.HasValue)
@@ -3672,23 +3838,31 @@ public sealed class OnionHopClient : IDisposable
 
         if (!isAdmin && !OperatingSystem.IsMacOS())
         {
-            if (OperatingSystem.IsLinux())
+            if (!OperatingSystem.IsLinux())
+            {
+                throw new InvalidOperationException("TUN/VPN mode requires elevated privileges (run as Administrator/root).");
+            }
+
+            if (!VpnService.CanElevateWithPkexec)
             {
                 throw new InvalidOperationException(BuildLinuxTunElevationHelp());
             }
 
-            throw new InvalidOperationException("TUN/VPN mode requires elevated privileges (run as Administrator/root).");
+            RaiseLog("TUN/VPN mode: asking for your password through polkit (pkexec) to start the tunnel. Only the tunnel runs as root; OnionHop keeps running as you.");
+            if (options.KillSwitchEnabled)
+            {
+                RaiseLog("The kill switch needs OnionHop itself to run as root on Linux, so it cannot block traffic while only the tunnel runs as root.");
+            }
         }
 
         await _vpnService.StartAsync(config, token).ConfigureAwait(false);
     }
 
-    // TUN/VPN mode on Linux creates a system TUN device, which needs root. Unlike Windows (UAC helper)
-    // and macOS (privileged tunnel / Network Extension), the Linux build launches the VPN core as a
-    // child of the app, so the whole app must already be elevated. Running a packaged AppImage under
-    // plain `sudo` usually fails silently (the GUI can't reach the user's X/Wayland display), so give
-    // the user the exact, env-preserving command for their actual launch target instead of a generic
-    // "run as root" error.
+    // TUN/VPN mode on Linux creates a system TUN device, which needs root. Without root, the tunnel
+    // core is started through polkit's pkexec, like the macOS administrator prompt (#90). This help is
+    // for systems without pkexec. Running a packaged AppImage under plain `sudo` usually fails
+    // silently (the GUI can't reach the user's X/Wayland display), so give the user the exact,
+    // env-preserving command for their actual launch target instead of a generic "run as root" error.
     private static string BuildLinuxTunElevationHelp()
     {
         var appImage = Environment.GetEnvironmentVariable("APPIMAGE");
@@ -3697,8 +3871,9 @@ public sealed class OnionHopClient : IDisposable
             : (Environment.ProcessPath ?? "OnionHop");
 
         return
-            "TUN/VPN mode needs root on Linux (it creates a system TUN device). Proxy Mode works without root. " +
-            "To use TUN/VPN mode, quit OnionHop and relaunch it elevated while keeping your graphical session, e.g.:\n" +
+            "TUN/VPN mode needs root on Linux (it creates a system TUN device). OnionHop asks for it through polkit, " +
+            "but pkexec is not installed (install the pkexec or policykit-1 package). Proxy Mode works without root. " +
+            "Or quit OnionHop and relaunch it elevated while keeping your graphical session, e.g.:\n" +
             $"    sudo -E \"{launchTarget}\"\n" +
             "If the window does not appear (common on Wayland), first run:  xhost +SI:localuser:root  then the sudo command above.";
     }
@@ -3826,6 +4001,43 @@ public sealed class OnionHopClient : IDisposable
     // Tor's per-country circumvention settings (what Smart Connect follows in censored countries) are
     // refreshed through Tor once connected, at most daily: bridges.torproject.org is blocked in exactly
     // the countries that need them, and this way the request never shows on the local network either.
+    // The first exit-IP lookup runs right after bootstrap, when the first circuits through a slow
+    // bridge can take longer than its budget, and the IP then showed "--.--.--.--" for the whole
+    // session (#89). Look again a few times while this connection lasts.
+    private static readonly TimeSpan[] ExitIpRetryDelays = [TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60)];
+    private int _exitIpRetrySerial;
+
+    private void StartExitIpRetryIfUnknown()
+    {
+        if (IPAddress.TryParse(_currentIp?.Trim(), out _))
+        {
+            return;
+        }
+
+        // A newer connection's retries replace these.
+        var serial = Interlocked.Increment(ref _exitIpRetrySerial);
+        _ = Task.Run(async () =>
+        {
+            foreach (var delay in ExitIpRetryDelays)
+            {
+                await Task.Delay(delay).ConfigureAwait(false);
+                if (serial != Volatile.Read(ref _exitIpRetrySerial) || !_isConnected || _isDisconnecting
+                    || IPAddress.TryParse(_currentIp?.Trim(), out _))
+                {
+                    return;
+                }
+
+                try
+                {
+                    await RefreshIpAsync(updateStatusMessage: false, CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+            }
+        });
+    }
+
     private void StartCircumventionSettingsBackgroundRefresh()
     {
         var socksPort = _activeSocksPort;
@@ -4130,10 +4342,11 @@ public sealed class OnionHopClient : IDisposable
             var percent = ExtractProgress(line);
             _bootstrapPercent = percent;
             _connectionProgress = percent / 100d;
-            if (_isConnecting)
+            var summary = ExtractBootstrapSummary(line);
+            if (!string.IsNullOrWhiteSpace(summary))
             {
-                var summary = ExtractBootstrapSummary(line);
-                if (!string.IsNullOrWhiteSpace(summary))
+                _bootstrapSummary = summary;
+                if (_isConnecting)
                 {
                     _statusMessage = summary;
                 }
@@ -4258,6 +4471,11 @@ public sealed class OnionHopClient : IDisposable
         if (TorLogHelper.TryParseArtiHopBootstrap(line, out var percent, out var stage))
         {
             _bootstrapPercent = percent;
+            if (stage is not null)
+            {
+                _bootstrapSummary = stage;
+            }
+
             if (_isConnecting)
             {
                 _connectionProgress = Math.Max(_connectionProgress, 0.2 + (0.6 * percent / 100d));
@@ -4474,6 +4692,34 @@ public sealed class OnionHopClient : IDisposable
     // scan found reachable. Same machine, bridges reachable by a plain TCP probe, yet the transport
     // (lyrebird / webtunnel-client) fails them all - which usually means a firewall or security tool is
     // blocking the transport helper process, or the bridges are dead at the protocol layer (#74).
+    /// <summary>
+    /// Where an attempt was when its time ran out says which part is blocked, where "timed out" alone
+    /// did not (#89): before 5% the transport program never got going, below 10% nothing got through
+    /// to a bridge or relay (a blocked address, or for Snowflake no proxy from the broker), below 20%
+    /// a connection stood but the handshake through it never finished, and past that the route works
+    /// and only Tor's directory download stalled. Arti and ArtiHop count their own percentages, so
+    /// for them only the step is named.
+    /// </summary>
+    internal static string DescribeAttemptTimeout(int percent, string? summary, int transportFailures, bool torPhases)
+    {
+        var stage = percent switch
+        {
+            <= 0 => "nothing answered",
+            < 5 => "the transport program did not get going",
+            < 10 => "no connection to a bridge or relay got through",
+            < 20 => "a connection was made, but the handshake through it did not finish",
+            _ => "the route works, but the download through it stalled"
+        };
+
+        var step = string.IsNullOrWhiteSpace(summary) ? string.Empty : $" ({summary.Trim().TrimEnd('.')})";
+        var failures = transportFailures > 0
+            ? $" The transport reported {transportFailures} failed connection{(transportFailures == 1 ? "" : "s")}."
+            : string.Empty;
+        return torPhases
+            ? $"Timed out at {percent}%{step}: {stage}.{failures}"
+            : $"Timed out at {percent}%{step}.{failures}";
+    }
+
     private void MaybeLogTransportBlockedHint()
     {
         const int minProxyFailures = 5;
