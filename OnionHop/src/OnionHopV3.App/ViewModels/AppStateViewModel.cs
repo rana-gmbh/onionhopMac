@@ -387,6 +387,15 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     public ObservableCollection<string> VpnLogLines { get; } = [];
 
     [ObservableProperty] private string _downloadSpeed = "--";
+
+    // Tor-only mode (#94). The toggle shows what Windows Firewall does, read at startup, not a saved
+    // setting: the firewall keeps the mode across restarts, and it can be changed outside OnionHop.
+    [ObservableProperty] private bool _torOnlyModeEnabled = OnionHopClient.IsTorOnlyModeOn;
+    [ObservableProperty] private bool _isTorOnlyModeBusy;
+    [ObservableProperty] private string _torOnlyModeStatusText = OnionHopClient.IsTorOnlyModeOn
+        ? LocalizationService.Get("Settings.TorOnlyModeOnStatus")
+        : string.Empty;
+    private bool _syncingTorOnlyMode;
     [ObservableProperty] private string _uploadSpeed = "--";
     [ObservableProperty] private double _downloadSpeedGauge;
     [ObservableProperty] private double _uploadSpeedGauge;
@@ -594,6 +603,54 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
     public bool IsLinux => OperatingSystem.IsLinux();
     public bool IsMacOS => OperatingSystem.IsMacOS();
     public bool ShowWindowsOnlySettings => IsWindows;
+    public bool CanToggleTorOnlyMode => OnionHopClient.IsTorOnlyModeAvailable && !IsTorOnlyModeBusy;
+    public bool HasTorOnlyModeStatus => !string.IsNullOrEmpty(TorOnlyModeStatusText);
+
+    partial void OnIsTorOnlyModeBusyChanged(bool value) => OnPropertyChanged(nameof(CanToggleTorOnlyMode));
+
+    partial void OnTorOnlyModeStatusTextChanged(string value) => OnPropertyChanged(nameof(HasTorOnlyModeStatus));
+
+    partial void OnTorOnlyModeEnabledChanged(bool value)
+    {
+        if (!_syncingTorOnlyMode)
+        {
+            _ = ApplyTorOnlyModeAsync(value);
+        }
+    }
+
+    private async Task ApplyTorOnlyModeAsync(bool on)
+    {
+        IsTorOnlyModeBusy = true;
+        TorOnlyModeStatusText = LocalizationService.Get("Settings.TorOnlyModeWorking");
+        try
+        {
+            var (success, message) = await _client.SetTorOnlyModeAsync(on);
+            if (!success)
+            {
+                AppendLog($"Tor-only mode: {message}");
+            }
+
+            // Show what the firewall does now, also when the change failed half way.
+            _syncingTorOnlyMode = true;
+            TorOnlyModeEnabled = OnionHopClient.IsTorOnlyModeOn;
+            _syncingTorOnlyMode = false;
+            TorOnlyModeStatusText = !success
+                ? string.Format(CultureInfo.CurrentCulture, LocalizationService.Get("Settings.TorOnlyModeFailed"), message)
+                : TorOnlyModeEnabled ? LocalizationService.Get("Settings.TorOnlyModeOnStatus") : string.Empty;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Tor-only mode: {ex.Message}");
+            _syncingTorOnlyMode = true;
+            TorOnlyModeEnabled = OnionHopClient.IsTorOnlyModeOn;
+            _syncingTorOnlyMode = false;
+            TorOnlyModeStatusText = string.Format(CultureInfo.CurrentCulture, LocalizationService.Get("Settings.TorOnlyModeFailed"), ex.Message);
+        }
+        finally
+        {
+            IsTorOnlyModeBusy = false;
+        }
+    }
     public bool ShowMacOnlySettings => IsMacOS;
     public bool ShowTunStackOptions => !IsMacOS;
     public string VpnLogTabHeader => TunEngineLogTabHeader;
@@ -1436,9 +1493,21 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         {
             try
             {
+                // Fill the exit and entry lists at once from the last saved list or the one that ships
+                // with the app: Onionoo is blocked in the countries that need Tor most, and a blocked
+                // lookup only gives up after 30 seconds.
+                var offline = _nodeDatabaseService.GetOfflineCountryStats();
+                if (offline.Count > 0)
+                {
+                    Dispatcher.UIThread.Post(() => ApplyCountryStats(offline));
+                }
+
                 await Task.Delay(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
                 var countries = await _nodeDatabaseService.GetCountryStatsAsync(AppendLog, CancellationToken.None).ConfigureAwait(false);
-                Dispatcher.UIThread.Post(() => ApplyCountryStats(countries));
+                if (_nodeDatabaseService.HasCurrentData || offline.Count == 0)
+                {
+                    Dispatcher.UIThread.Post(() => ApplyCountryStats(countries));
+                }
             }
             catch (Exception ex)
             {
@@ -3279,6 +3348,44 @@ public sealed partial class AppStateViewModel : ViewModelBase, IDisposable
         }
 
         return location.ToUpperInvariant();
+    }
+
+    /// <summary>An HTTP client that goes through the connected Tor; null while not connected.</summary>
+    public System.Net.Http.HttpClient? CreateTorHttpClient(TimeSpan timeout) => _client.CreateTorHttpClient(timeout);
+
+    /// <summary>
+    /// Loads the country list through Tor once connected when the one held is not current. The lookup
+    /// at startup goes direct, and Onionoo (torproject.org) is blocked in Russia, Iran, China and
+    /// elsewhere, so there the exit list otherwise never got past the copy that ships with the app.
+    /// </summary>
+    private void StartCountryStatsRefreshThroughTor()
+    {
+        if (_nodeDatabaseService.HasCurrentData)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var client = _client.CreateTorHttpClient(TimeSpan.FromSeconds(90));
+                if (client == null)
+                {
+                    return;
+                }
+
+                using var budget = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+                var countries = await _nodeDatabaseService.RefreshThroughTorIfOutdatedAsync(client, AppendLog, budget.Token).ConfigureAwait(false);
+                if (countries != null)
+                {
+                    Dispatcher.UIThread.Post(() => ApplyCountryStats(countries));
+                }
+            }
+            catch
+            {
+            }
+        });
     }
 
     private void ApplyCountryStats(IReadOnlyList<TorCountryNodeStats> stats)
