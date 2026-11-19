@@ -14,19 +14,21 @@ PT_DIR="$TOR_DIR/pluggable_transports"
 TEMP_DIR="$REPO_ROOT/temp_deps_macos"
 
 # Versions (keep in sync with download-deps.sh)
-TOR_VERSION="15.0.26"
-WEBTUNNEL_VERSION="v0.0.3"
+TOR_VERSION="16.0.1"
+WEBTUNNEL_VERSION="v0.0.7"
 # sing-box and Xray stay on the versions OnionHop's configs are tested against
 # (DependencyManager.SingBoxVersion / XrayVersion), checked against the same SHA-256s.
-SING_BOX_VERSION="1.13.13"
-XRAY_VERSION="v26.3.27"
+SING_BOX_VERSION="1.14.4"
+XRAY_VERSION="v26.11.9"
 CORE_SHA256="
-sing-box-1.13.13-darwin-amd64.tar.gz 477afd64ad7751214f01338ba244265ecc223966ddb58214963f526dca7f424e
-sing-box-1.13.13-darwin-arm64.tar.gz 4ac414d4ede9ec21bc79d8ccf40b4679429203b9e06ad96d2d8d34c0fe940558
-Xray-macos-64.zip f5b0471d3459eff1b82e48af0aeac186abcc3298210070afbbbd8437a4e8b203
-Xray-macos-arm64-v8a.zip 2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf
+sing-box-1.14.4-darwin-amd64.tar.gz eae86b9b033bba50b7c44ab719e4bfac0aca05efd28483390ed3aa510f32db25
+sing-box-1.14.4-darwin-arm64.tar.gz 0d8c7f5ed5d587b0f1a5e9772a708ec3bfa4ac4c9329604b01d8d9c2ba406838
+Xray-macos-64.zip 488963e676e06f5e48547f9dd38116aaca8de4234959b4272ae8f284e658dfd0
+Xray-macos-arm64-v8a.zip 233f0c66681cd0726f81a6b2b6ed6a5710869e312047b522e46ed53035bebd26
 "
 ARTI_HOP_REPO_URL="https://github.com/center2055/ArtiHop.git"
+# ArtiHop 0.3.0, the same commit as download-deps.sh.
+ARTI_HOP_COMMIT="4a9f72780764960fb39b0f75615a314c3a9a253f"
 SNOWFLAKE_REPO_URL="https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake.git"
 
 mkdir -p "$TOR_DIR" "$VPN_DIR" "$ARTI_HOP_DIR" "$SNOWFLAKE_DIR" "$PT_DIR" "$TEMP_DIR"
@@ -173,7 +175,9 @@ if command -v cargo >/dev/null 2>&1; then
     if (
         set -e
         ARTI_HOP_CLONE="$TEMP_DIR/ArtiHop"
-        git clone --depth 1 "$ARTI_HOP_REPO_URL" "$ARTI_HOP_CLONE"
+        git init -q "$ARTI_HOP_CLONE"
+        git -C "$ARTI_HOP_CLONE" fetch -q --depth 1 "$ARTI_HOP_REPO_URL" "$ARTI_HOP_COMMIT"
+        git -C "$ARTI_HOP_CLONE" checkout -q FETCH_HEAD
         cd "$ARTI_HOP_CLONE"
         rustup target add x86_64-apple-darwin aarch64-apple-darwin
         cargo build --release --target aarch64-apple-darwin

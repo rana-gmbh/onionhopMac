@@ -346,6 +346,9 @@
   <x:String x:Key="TunStack.Mixed">Mixed (recommended)</x:String>
   <x:String x:Key="TunStack.System">System</x:String>
   <x:String x:Key="TunStack.Gvisor">gVisor</x:String>
+  <x:String x:Key="TunStack.MixedPlain">Mixed</x:String>
+  <x:String x:Key="TunStack.GvisorRecommended">gVisor (recommended)</x:String>
+  <x:String x:Key="Settings.TunStackHintLinux">How the tunnel handles traffic. gVisor works with firewalls such as ufw and firewalld. Mixed and System can be a little faster, but the firewall then has to allow incoming traffic on the OnionHop interface.</x:String>
   <x:String x:Key="TunCore.SingBox">sing-box (recommended)</x:String>
   <x:String x:Key="TunCore.Xray">xray (experimental)</x:String>
 
@@ -473,7 +476,7 @@
   <x:String x:Key="Settings.TorEngineArtiHop">ArtiHop fast (2-hop)</x:String>
   <x:String x:Key="Settings.TorEngineHint">Automatic uses the classic runtime unless a supported Arti runtime is selected.</x:String>
   <x:String x:Key="Settings.TorEnginePreviewHint">Arti starts a local SOCKS runtime when the arti binary is bundled, on PATH, or set through ONIONHOP_ARTI_PATH.</x:String>
-  <x:String x:Key="Settings.TorEngineArtiHopHint">ArtiHop uses shortened 2-hop (Guard→Exit) circuits for lower latency. Faster than standard Tor, but weaker anonymity. Needs the artihop binary bundled, on PATH, or set via ONIONHOP_ARTIHOP_PATH.</x:String>
+  <x:String x:Key="Settings.TorEngineArtiHopHint">ArtiHop uses shortened 2-hop (Guard→Exit) circuits: faster than standard Tor, but weaker anonymity. With bridges it uses 3 hops, because Tor exits refuse 2-hop circuits through a bridge. The Exit Location applies. An entry location and pinned relays are not supported, and with an upstream proxy the Classic engine is used instead.</x:String>
 
   <!-- Snowflake proxy (volunteer) -->
   <x:String x:Key="Snowflake.SectionTitle">Snowflake bridge (volunteer)</x:String>

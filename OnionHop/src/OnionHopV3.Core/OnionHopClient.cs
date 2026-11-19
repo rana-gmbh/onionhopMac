@@ -1981,6 +1981,32 @@ public sealed class OnionHopClient : IDisposable
     /// deliberately not in the tunnel's direct list, and nothing excludes it by user id), which is
     /// what makes a "leaking" verdict trustworthy.
     /// </summary>
+    private int _linuxFirewallHintLogged;
+
+    /// <summary>
+    /// On Linux the Mixed and System stacks hand TCP to the kernel through the tunnel interface, and
+    /// a firewall that denies incoming traffic by default (ufw, firewalld) drops it there: DNS still
+    /// resolves, but no connection gets through, and the tunnel check times out (#97). Say so once
+    /// per connect when the check cannot get through with one of those stacks.
+    /// </summary>
+    private void LogLinuxFirewallHintOnce(OnionHopConnectOptions options)
+    {
+        if (!TunStackNeedsFirewallRule(OperatingSystem.IsLinux(), options.TunCoreMode, options.TunStackMode)
+            || Interlocked.Exchange(ref _linuxFirewallHintLogged, 1) == 1)
+        {
+            return;
+        }
+
+        RaiseLog("If nothing loads in TUN mode: with the Mixed or System TUN stack, a firewall such as ufw or firewalld " +
+                 "drops the tunnel's connections. Set the TUN stack to gVisor (Settings, or --tun-stack gvisor), " +
+                 "or allow incoming traffic on the tunnel interface, e.g. `sudo ufw allow in on OnionHop`.");
+    }
+
+    internal static bool TunStackNeedsFirewallRule(bool linux, string? tunCoreMode, string? tunStackMode) =>
+        linux
+        && !string.Equals(tunCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.OrdinalIgnoreCase)
+        && TorLogHelper.NormalizeTunStackModeForSingBox(tunStackMode, linux) != "gvisor";
+
     private async Task VerifyTunnelCarriesTrafficAsync(bool force)
     {
         var options = _activeOptions;
@@ -2041,12 +2067,18 @@ public sealed class OnionHopClient : IDisposable
                         ? "Tunnel check skipped: OnionHop had not seen this computer's own IP before connecting, so there is nothing to compare against."
                         : "Tunnel check could not complete (the lookup failed). It will retry."
                 });
+                if (verdict == TunnelCheckState.Unverifiable && !explainedByRules && _lastKnownDirectIp != null)
+                {
+                    LogLinuxFirewallHintOnce(options);
+                }
+
                 PublishStatus();
             }
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             RaiseLog($"Tunnel check failed to run: {ex.Message}");
+            LogLinuxFirewallHintOnce(options);
         }
         finally
         {
@@ -2341,9 +2373,29 @@ public sealed class OnionHopClient : IDisposable
             return;
         }
 
+        // ArtiHop 0.3+ takes the country over its control listener; streams opened afterwards use it.
+        if (string.Equals(_activeTorEngine, OnionHopConnectOptions.TorEngineArtiHop, StringComparison.Ordinal) &&
+            _artiHopService.CanChangeExitCountry)
+        {
+            using var hopCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+            hopCts.CancelAfter(TimeSpan.FromSeconds(8));
+            if (!await _artiHopService.SendExitCountryAsync(countryCode, hopCts.Token).ConfigureAwait(false))
+            {
+                RaiseLog("ArtiHop did not take the new exit country; reconnect to apply it.");
+                return;
+            }
+
+            RaiseLog(string.IsNullOrWhiteSpace(countryCode)
+                ? "Exit country cleared (Automatic). New connections use any exit."
+                : $"Exit country changed to {countryCode.ToUpperInvariant()}. New connections use exits there.");
+            await Task.Delay(1500, token).ConfigureAwait(false);
+            await RefreshIpAsync(updateStatusMessage: true, token).ConfigureAwait(false);
+            return;
+        }
+
         if (IsUsingArtiRuntime)
         {
-            RaiseLog("Exit country changes are not applied live in Arti mode; reconnect with classic Tor for live exit pinning.");
+            RaiseLog("Exit country changes are not applied live with this engine; reconnect to apply them, or use the Classic engine.");
             return;
         }
 
@@ -2967,6 +3019,7 @@ public sealed class OnionHopClient : IDisposable
             // A new session gets a fresh verdict, checked as soon as it is up.
             _tunnelCheck = TunnelCheckState.NotApplicable;
             _lastTunnelCheckUtc = DateTime.MinValue;
+            Interlocked.Exchange(ref _linuxFirewallHintLogged, 0);
             _connectionStatus = "Disconnected";
             _connectionProgress = 0;
             _activeSocksPort = DefaultSocksPort;
@@ -3584,6 +3637,28 @@ public sealed class OnionHopClient : IDisposable
         PublishStatus();
     }
 
+    /// <summary>
+    /// The location and relay settings ArtiHop has no way to apply, named as in Settings. The exit
+    /// country is not among them: ArtiHop 0.3+ applies it.
+    /// </summary>
+    internal static IReadOnlyList<string> DescribeSettingsArtiHopIgnores(OnionHopConnectOptions options)
+    {
+        var ignored = new List<string>();
+        if (!IsAutomaticLocation(options.SelectedEntryLocation))
+        {
+            ignored.Add("an entry location");
+        }
+
+        if (!string.IsNullOrWhiteSpace(options.EntryNodeFingerprint) ||
+            !string.IsNullOrWhiteSpace(options.MiddleNodeFingerprint) ||
+            !string.IsNullOrWhiteSpace(options.ExitNodeFingerprint))
+        {
+            ignored.Add("pinned relays");
+        }
+
+        return ignored;
+    }
+
     private async Task StartArtiHopAsync(OnionHopConnectOptions options, CancellationToken token)
     {
         var artiHopPath = ResolveArtiHopPath();
@@ -3609,13 +3684,34 @@ public sealed class OnionHopClient : IDisposable
             RaiseLog("ArtiHop uses shortened 2-hop (Guard -> Exit) circuits for lower latency. This is faster than standard Tor but provides weaker anonymity than full 3-hop circuits.");
         }
 
-        if (!IsAutomaticLocation(options.SelectedLocation) ||
-            !IsAutomaticLocation(options.SelectedEntryLocation) ||
-            !string.IsNullOrWhiteSpace(options.EntryNodeFingerprint) ||
-            !string.IsNullOrWhiteSpace(options.MiddleNodeFingerprint) ||
-            !string.IsNullOrWhiteSpace(options.ExitNodeFingerprint))
+        // The exit country goes to ArtiHop 0.3+, which only uses exits in that country, in the 2-hop
+        // mode too. Before, every location setting was ignored with ArtiHop and only this log said so.
+        var exitCountrySupported = ArtiHopService.SupportsExitCountry(artiHopPath);
+        var exitCountry = string.Empty;
+        if (!IsAutomaticLocation(options.SelectedLocation))
         {
-            RaiseLog("ArtiHop mode ignores country and relay pinning; use the Classic engine if you need those.");
+            exitCountry = TorNodeDatabaseService.NormalizeSelectionToCountryCode(
+                options.SelectedLocation,
+                _nodeDatabaseService.GetCountryStatsWithoutLookup()) ?? string.Empty;
+            if (!exitCountrySupported)
+            {
+                RaiseLog("This ArtiHop build cannot choose the exit country, so the Exit Location is not used. Update OnionHop's ArtiHop, or use the Classic engine.");
+                exitCountry = string.Empty;
+            }
+            else if (string.IsNullOrWhiteSpace(exitCountry))
+            {
+                RaiseLog($"Exit Location '{options.SelectedLocation}' is not a country ArtiHop can use; exits are chosen automatically.");
+            }
+            else
+            {
+                RaiseLog($"ArtiHop exit country: {exitCountry.ToUpperInvariant()}. Only exit relays in that country are used.");
+            }
+        }
+
+        var ignored = DescribeSettingsArtiHopIgnores(options);
+        if (ignored.Count > 0)
+        {
+            RaiseLog($"ArtiHop does not support {string.Join(", ", ignored)}, so {(ignored.Count == 1 ? "that setting is" : "those settings are")} not used. Use the Classic engine for {(ignored.Count == 1 ? "it" : "them")}.");
         }
 
         // ArtiHop (our Arti fork) now supports bridges + pluggable transports via Arti's native config.
@@ -3724,7 +3820,9 @@ public sealed class OnionHopClient : IDisposable
             ControlPort = controlPort,
             Mode = artiHopMode,
             WorkingDirectory = Path.GetDirectoryName(artiHopPath),
-            BridgesConfigPath = bridgesConfigPath
+            BridgesConfigPath = bridgesConfigPath,
+            ExitCountry = exitCountry,
+            ExitCountrySupported = exitCountrySupported
         }, token).ConfigureAwait(false);
 
         var hopLabel = usingBridges ? "3-hop" : "2-hop";
@@ -3855,7 +3953,7 @@ public sealed class OnionHopClient : IDisposable
         _activeVpnCoreMode = tunCoreMode;
         _singBoxLogProcessor.SetSourceLabel(tunCoreMode);
         if (string.Equals(tunCoreMode, OnionHopConnectOptions.TunCoreXray, StringComparison.Ordinal) &&
-            (!string.Equals(options.TunStackMode, OnionHopConnectOptions.TunStackMixed, StringComparison.OrdinalIgnoreCase) || !options.TunStrictRoute))
+            (!string.Equals(options.TunStackMode, OnionHopConnectOptions.DefaultTunStackMode, StringComparison.OrdinalIgnoreCase) || !options.TunStrictRoute))
         {
             RaiseLog("xray currently ignores TUN stack and strict-route tuning; using xray defaults.");
         }
